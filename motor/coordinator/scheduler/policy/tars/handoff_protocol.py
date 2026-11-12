@@ -78,7 +78,7 @@ class HandoffFailureCode(str, Enum):
     STALE_ATTEMPT = "stale_attempt"
     INVALID_STATE = "invalid_state"
     CAPACITY_EXHAUSTED = "capacity_exhausted"
-    DELIVERY_TOKEN_MISMATCH = "delivery_token_mismatch"
+    DELIVERY_TOKEN_MISMATCH = "delivery_token_mismatch"  # nosec B105 -- protocol error code
     PRECONFIRM_DISPATCH = "preconfirm_dispatch"
     ROUTER_LEDGER_CONFLICT = "router_ledger_conflict"
     TARGET_MISMATCH = "target_mismatch"

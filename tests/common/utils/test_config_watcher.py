@@ -16,8 +16,28 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from watchdog.observers.polling import PollingObserver
+
 from motor.common.utils.config_watcher import ConfigWatcher
 from motor.config.controller import ControllerConfig
+
+
+def _start_portable_watcher(watcher: ConfigWatcher) -> None:
+    """Use a low-latency polling observer for deterministic cross-platform tests."""
+    with patch(
+        "motor.common.utils.config_watcher.Observer",
+        side_effect=lambda: PollingObserver(timeout=0.01),
+    ):
+        watcher.start()
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 def test_watcher_reloads_atomically_replaced_config(tmp_path: Path) -> None:
@@ -63,7 +83,7 @@ def test_watcher_start_stop():
 
     try:
         watcher = ConfigWatcher(config_path, lambda: True)
-        watcher.start()
+        _start_portable_watcher(watcher)
 
         assert watcher.observer is not None
         assert watcher.event_handler is not None
@@ -102,19 +122,13 @@ def test_config_reload_callback():
 
     try:
         watcher = ConfigWatcher(config_path, mock_reload, debounce_seconds=0.1)
-        watcher.start()
-
-        # Wait a bit for watcher to start
-        time.sleep(0.05)
+        _start_portable_watcher(watcher)
 
         # Modify the file
-        with open(config_path, 'w', encoding='utf-8') as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"key": "value2"}, f)
 
-        # Wait for reload
-        time.sleep(0.05)
-
-        assert reload_called is True
+        assert _wait_until(lambda: reload_called)
 
     finally:
         watcher.stop()
@@ -138,7 +152,7 @@ def test_watcher_with_controller_config():
             "api_config": {"controller_api_host": "127.0.0.1", "controller_api_port": 8000},
         }
 
-        with open(config_path, 'w', encoding='utf-8') as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f)
 
         # Load config
@@ -147,28 +161,15 @@ def test_watcher_with_controller_config():
 
         # Start watcher
         watcher = ConfigWatcher(config_path, config.reload, debounce_seconds=0.1)
-        watcher.start()
-
-        # Wait for watcher to start
-        time.sleep(0.05)
+        _start_portable_watcher(watcher)
 
         # Modify config
         config_data["logging_config"]["log_level"] = "DEBUG"
-        with open(config_path, 'w', encoding='utf-8') as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f)
 
-        # Wait for reload with retry logic
-        max_attempts = 10
-        reloaded = False
-        for attempt in range(max_attempts):
-            time.sleep(0.05)
-            if config.logging_config.log_level == "DEBUG":
-                reloaded = True
-                break
-
-        # Check if config was reloaded
-        assert reloaded, (
-            f"Config reload failed after {max_attempts} attempts. Current log_level: {config.logging_config.log_level}"
+        assert _wait_until(lambda: config.logging_config.log_level == "DEBUG"), (
+            f"Config reload failed. Current log_level: {config.logging_config.log_level}"
         )
 
     finally:
@@ -241,7 +242,7 @@ def test_watcher_with_config_update_integration():
         updated_config = {"logging_config": {"log_level": "DEBUG"}}
 
         # Write initial config
-        with open(config_file, 'w', encoding='utf-8') as f:
+        with open(config_file, "w", encoding="utf-8") as f:
             json.dump(initial_config, f)
 
         # Create mock config object
@@ -258,15 +259,13 @@ def test_watcher_with_config_update_integration():
                 config_path=config_file, reload_callback=mock_config.reload, config_update_callback=mock_callback
             )
 
-            watcher.start()
+            _start_portable_watcher(watcher)
 
             # Simulate file modification
-            time.sleep(0.01)  # Reduced delay to ensure watcher is ready
-            with open(config_file, 'w', encoding='utf-8') as f:
+            with open(config_file, "w", encoding="utf-8") as f:
                 json.dump(updated_config, f)
 
-            # Wait for watcher to detect change
-            time.sleep(0.05)  # Reduced wait time
+            assert _wait_until(lambda: mock_callback.called)
 
             # Stop watcher
             watcher.stop()

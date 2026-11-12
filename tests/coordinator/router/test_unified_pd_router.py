@@ -194,7 +194,7 @@ async def test_tars_joint_bookkeeping_failure_rolls_back_both_attempt_resources(
     config = _config()
     manager = RequestManager(config)
     scheduler = _Scheduler()
-    scheduler.tars_abort = AsyncMock(return_value=True)
+    scheduler.tars_abort = AsyncMock(return_value=True)  # pylint: disable=attribute-defined-outside-init
     req_info = RequestInfo(req_id="joint-bookkeeping", req_data={}, req_len=1, api="/test")
     router = UnifiedPDRouter(req_info, config, scheduler=scheduler, request_manager=manager)
     await manager.add_req_info(req_info)

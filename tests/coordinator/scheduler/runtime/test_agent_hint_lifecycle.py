@@ -41,9 +41,7 @@ def test_build_manage_request_body_messages_requires_block_coords():
     with pytest.raises(ValueError):
         build_manage_request_body("s-1", "evict", model="m", target="messages")
 
-    body = build_manage_request_body(
-        "s-1", "evict", model="m", target="messages", block_start=0, block_end=6
-    )
+    body = build_manage_request_body("s-1", "evict", model="m", target="messages", block_start=0, block_end=6)
     assert body["agent_hint"]["context_management"]["edits"][0]["block_end"] == 6
 
 
@@ -99,9 +97,7 @@ async def test_missing_sender_degrades_to_warning():
 
 
 def test_summarize_edit_results_counts_status_and_ignores_garbage():
-    assert summarize_edit_results(
-        [{"op_status": True}, {"op_status": False}, "ignored", {}]
-    ) == (1, 1)
+    assert summarize_edit_results([{"op_status": True}, {"op_status": False}, "ignored", {}]) == (1, 1)
     assert summarize_edit_results(None) == (0, 0)
 
 
@@ -129,17 +125,25 @@ async def test_scheduler_client_manage_request_disabled_returns_empty():
 
 @pytest.mark.asyncio
 async def test_pause_offloads_once_then_resume_prefetches_and_pause_rearms():
-    sender = AsyncMock(return_value=[{"op_status": True}])
+    offloaded = asyncio.Event()
+
+    async def send(_session_id, edit_type):
+        if edit_type == "offload":
+            offloaded.set()
+        return [{"op_status": True}]
+
+    sender = AsyncMock(side_effect=send)
     manager = AgentHintLifecycleManager(sender=sender, idle_offload_s=0.01)
     try:
         await manager.on_status("s-1", "pause")
         await manager.on_status("s-1", "pause")
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(offloaded.wait(), timeout=2.0)
         sender.assert_awaited_once_with("s-1", "offload")
 
         await manager.on_status("s-1", "resume")
+        offloaded.clear()
         await manager.on_status("s-1", "pause")
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(offloaded.wait(), timeout=2.0)
         assert sender.await_count == 3
         assert [call.args for call in sender.await_args_list] == [
             ("s-1", "offload"),
@@ -189,15 +193,18 @@ async def test_idle_evict_runs_after_offload():
 @pytest.mark.asyncio
 async def test_resume_after_offload_prefetches():
     calls: list[str] = []
+    offloaded = asyncio.Event()
 
     async def sender(_session_id: str, edit_type: str):
         calls.append(edit_type)
+        if edit_type == "offload":
+            offloaded.set()
         return [{"op_status": True}]
 
     manager = AgentHintLifecycleManager(sender=sender, idle_offload_s=0.01)
     try:
         await manager.on_status("s-1", "pause")
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(offloaded.wait(), timeout=2.0)
         await manager.on_status("s-1", "resume")
 
         assert calls == ["offload", "prefetch"]
@@ -209,15 +216,18 @@ async def test_resume_after_offload_prefetches():
 @pytest.mark.asyncio
 async def test_running_after_offload_does_not_prefetch_without_resume():
     calls: list[str] = []
+    offloaded = asyncio.Event()
 
     async def sender(_session_id: str, edit_type: str):
         calls.append(edit_type)
+        if edit_type == "offload":
+            offloaded.set()
         return [{"op_status": True}]
 
     manager = AgentHintLifecycleManager(sender=sender, idle_offload_s=0.01)
     try:
         await manager.on_status("s-1", "pause")
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(offloaded.wait(), timeout=2.0)
         await manager.on_status("s-1", "running")
 
         assert calls == ["offload"]
@@ -262,9 +272,12 @@ async def test_repeated_pause_does_not_restart_idle_timer():
 @pytest.mark.asyncio
 async def test_finalize_then_new_epoch_running_revives_and_allows_offload_again():
     calls: list[str] = []
+    offloaded = asyncio.Event()
 
     async def sender(_session_id: str, edit_type: str):
         calls.append(edit_type)
+        if edit_type == "offload":
+            offloaded.set()
         return [{"op_status": True}]
 
     manager = AgentHintLifecycleManager(sender=sender, idle_offload_s=0.01)
@@ -272,7 +285,7 @@ async def test_finalize_then_new_epoch_running_revives_and_allows_offload_again(
         await manager.on_status("s-1", "finalize", epoch=0)
         await manager.on_status("s-1", "running", epoch=1)
         await manager.on_status("s-1", "pause", epoch=1)
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(offloaded.wait(), timeout=2.0)
 
         assert calls == ["evict", "offload"]
         assert manager.stats()["epoch_revive"] == 1
@@ -282,23 +295,34 @@ async def test_finalize_then_new_epoch_running_revives_and_allows_offload_again(
 
 @pytest.mark.asyncio
 async def test_capacity_gate_skips_actions_without_pressure():
-    sender = AsyncMock(return_value=[{"op_status": True}])
+    checked = asyncio.Event()
+    sent = asyncio.Event()
     pressure = {"value": False}
+
+    async def send(_session_id, _edit_type):
+        sent.set()
+        return [{"op_status": True}]
+
+    def pressure_provider():
+        checked.set()
+        return pressure["value"]
+
+    sender = AsyncMock(side_effect=send)
     manager = AgentHintLifecycleManager(
         sender=sender,
         idle_offload_s=0.01,
-        pressure_provider=lambda: pressure["value"],
+        pressure_provider=pressure_provider,
     )
     try:
         await manager.on_status("s-1", "tool")
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(checked.wait(), timeout=2.0)
         sender.assert_not_awaited()
         assert manager.stats()["gate_skip"] == 1
 
         pressure["value"] = True
         await manager.on_status("s-1", "resume")
         await manager.on_status("s-1", "pause")
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(sent.wait(), timeout=2.0)
         sender.assert_awaited_once_with("s-1", "offload")
     finally:
         await manager.aclose()
@@ -339,7 +363,7 @@ def test_capacity_pressure_uses_kv_usage_high_water(monkeypatch):
     client._kvc_lifecycle = SimpleNamespace(offload_kv_usage_high_water=0.8)
     endpoint = SimpleNamespace(id=1)
     instance = SimpleNamespace(id=1, get_all_endpoints=lambda include_headless=True: [endpoint])
-    client._instances_from_cache = lambda: {1: instance}
+    client._instances_from_cache = lambda role=None: {1: instance}
     monkeypatch.setattr(scheduler_client_module, "get_endpoint_kv_cache_usage", lambda _i, _e: 0.5)
     assert client.capacity_pressure() is False
     monkeypatch.setattr(scheduler_client_module, "get_endpoint_kv_cache_usage", lambda _i, _e: 0.9)
@@ -430,12 +454,22 @@ async def test_central_lifecycle_finalize_evicts_and_releases_pins():
 
 @pytest.mark.asyncio
 async def test_tool_and_suspend_aliases_are_pause():
-    sender = AsyncMock(return_value=[{"op_status": True}])
+    both_sent = asyncio.Event()
+    sent_count = 0
+
+    async def send(_session_id, _edit_type):
+        nonlocal sent_count
+        sent_count += 1
+        if sent_count == 2:
+            both_sent.set()
+        return [{"op_status": True}]
+
+    sender = AsyncMock(side_effect=send)
     manager = AgentHintLifecycleManager(sender=sender, idle_offload_s=0.01)
     try:
         await manager.on_status("s-tool", "tool")
         await manager.on_status("s-suspend", "suspend")
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(both_sent.wait(), timeout=2.0)
 
         assert [call.args for call in sender.await_args_list] == [
             ("s-tool", "offload"),
@@ -469,7 +503,7 @@ async def test_manage_request_build_error_keeps_prior_results_and_continues(monk
     pins = [SimpleNamespace(instance_id=1, endpoint_id=10), SimpleNamespace(instance_id=2, endpoint_id=20)]
     instances = {1: SimpleNamespace(model_name="m1"), 2: SimpleNamespace(model_name="m2")}
     client._session_pins_for_manage = lambda _sid: pins
-    client._instances_from_cache = lambda: instances
+    client._instances_from_cache = lambda role=None: instances
     client._endpoint_for_pin = lambda _instance, _endpoint_id: SimpleNamespace(ip="127.0.0.1", business_port=8000)
     client._post_manage_request = AsyncMock(return_value={"op_status": True})
     calls = {"count": 0}

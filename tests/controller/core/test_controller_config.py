@@ -8,12 +8,14 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 # pylint: disable=redefined-outer-name,unspecified-encoding
-import os
-import time
 import json
-import pytest
+import os
 import tempfile
+import time
 from unittest.mock import patch
+
+import pytest
+from watchdog.observers.polling import PollingObserver
 
 from motor.config.controller import ControllerConfig
 
@@ -706,6 +708,7 @@ def modify_config_api_port(config_path: str, new_port: int):
 def test_dynamic_config_reload_with_watcher():
     """Test dynamic config reload through ConfigWatcher"""
     import uuid
+
     from motor.common.utils.config_watcher import ConfigWatcher
 
     # Create a unique config file for this test to avoid parallel test interference
@@ -724,10 +727,11 @@ def test_dynamic_config_reload_with_watcher():
 
         # Start watcher
         watcher = ConfigWatcher(config_file, config.reload, debounce_seconds=0.1)
-        watcher.start()
-
-        # Wait for watcher to start
-        time.sleep(0.2)
+        with patch(
+            "motor.common.utils.config_watcher.Observer",
+            side_effect=lambda: PollingObserver(timeout=0.01),
+        ):
+            watcher.start()
 
         # Modify config values
         modify_config_api_port(config_file, 9000)

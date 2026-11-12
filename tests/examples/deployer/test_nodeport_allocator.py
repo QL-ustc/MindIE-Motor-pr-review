@@ -14,8 +14,9 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import lib.constant as C
 import pytest
-
+from lib.generator import k8s_utils
 from lib.nodeport_allocator import (
     ClusterNodePort,
     PlannedNodePort,
@@ -24,13 +25,19 @@ from lib.nodeport_allocator import (
     collect_cluster_nodeports,
     collect_planned_nodeports,
     find_conflicts,
-    rewrite_yaml_nodeports,
     resolve_and_rewrite_nodeports,
+    rewrite_yaml_nodeports,
     write_nodeport_conflict_files,
 )
-from lib.generator import k8s_utils
 from lib.utils import is_observability_service_name
-import lib.constant as C
+
+
+@pytest.fixture(autouse=True)
+def _isolate_nodeport_warning_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep resolver warning-file side effects out of the source worktree."""
+    output_root = tmp_path / "default_output_yamls"
+    output_root.mkdir()
+    monkeypatch.setattr(C, "OUTPUT_ROOT_PATH", str(output_root))
 
 
 def _write_svc_yaml(path: Path, name: str, namespace: str, node_port: int, port: int = 1025) -> None:

@@ -8,7 +8,7 @@
 // MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PSL v2 for more details.
 
-//! KV Conductor — Radix-tree-based KV cache indexer for MindIE-PyMotor.
+//! KV Conductor — Radix-tree-based KV cache indexer for MindIE-Motor.
 //!
 //! Provides a standalone HTTP service that maintains prefix trees of cached
 //! KV blocks per (model, tenant) pair. Workers register their endpoints and

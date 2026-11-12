@@ -275,13 +275,11 @@ def test_observability_server_has_no_central_owner_by_default():
 
 def test_obs_central_route_owns_timer_and_finalize(monkeypatch):
     """Same pause/running delivered to the single owner cancels the idle timer."""
-    import time
-
     config = CoordinatorConfig()
     config.agent_status_config.enabled = True
     config.agent_status_config.central_lifecycle = True
     config.kvc_lifecycle_config.enabled = True
-    config.kvc_lifecycle_config.idle_offload_s = 0.02
+    config.kvc_lifecycle_config.idle_offload_s = 60.0
 
     server = ObservabilityServer(config=config)
     manage = AsyncMock(return_value=[{"op_status": True}])
@@ -309,26 +307,34 @@ def test_obs_central_route_owns_timer_and_finalize(monkeypatch):
             return None
 
     server._scheduler_connection = _Connection()
-    client = TestClient(server.observability_app)
-    event = lambda state: {"session": {"session_id": "s-owner"}, "agent_status": {"state": state}}
+    monkeypatch.setattr("motor.coordinator.api_server.observability_server.MetricsCollector", MagicMock())
 
-    assert client.post("/internal/agent-status", json=event("pause")).status_code == 200
-    time.sleep(0.01)
-    assert client.post("/internal/agent-status", json=event("running")).status_code == 200
-    time.sleep(0.08)
-    manage.assert_not_awaited()
+    def event(state):
+        return {"session": {"session_id": "s-owner"}, "agent_status": {"state": state}}
 
-    assert client.post("/internal/agent-status", json=event("finalize")).status_code == 200
-    manage.assert_awaited_once_with("s-owner", "evict")
-    report.assert_awaited_once_with("s-owner", "finalize", None)
-    metrics = {metric.name: metric.label for metric in server._provide_kvc_metrics()}
-    assert metrics["motor:kvc_evict_total"] == ['motor:kvc_evict_total{scope="central"}']
+    # A single lifespan owns both HTTP requests and the timer. Assert cancellation
+    # directly instead of assuming two HTTP requests finish within 20 milliseconds.
+    with TestClient(server.observability_app) as client:
+        assert client.post("/internal/agent-status", json=event("pause")).status_code == 200
+        lifecycle = server._central_lifecycle.lifecycle
+        timers = tuple(lifecycle._sessions["s-owner"].timers)
+        assert len(timers) == 1
+        assert not timers[0].done()
+        assert client.post("/internal/agent-status", json=event("running")).status_code == 200
+        assert lifecycle._sessions["s-owner"].timers == []
+        assert timers[0].cancelled() or timers[0].cancelling()
+        manage.assert_not_awaited()
+
+        assert client.post("/internal/agent-status", json=event("finalize")).status_code == 200
+        manage.assert_awaited_once_with("s-owner", "evict")
+        report.assert_awaited_once_with("s-owner", "finalize", None)
+        metrics = {metric.name: metric.label for metric in server._provide_kvc_metrics()}
+        assert metrics["motor:kvc_evict_total"] == ['motor:kvc_evict_total{scope="central"}']
 
 
 def test_sched_metrics_shm_not_ready_still_exports_kvc_metrics():
     """A lagging sched shm must not hide KVC counters from /metrics."""
     from motor.coordinator.api_server.observability_server import (
-        ObservabilityServer,
         SchedulerMetricsShmReader,
     )
 

@@ -12,7 +12,7 @@
 // Local copy: licenses/Apache-2.0.txt
 // Attribution: THIRD_PARTY_NOTICES.md
 //
-// Modified by Huawei Technologies Co., Ltd. for MindIE-PyMotor KV Conductor
+// Modified by Huawei Technologies Co., Ltd. for MindIE-Motor KV Conductor
 // (WorkerKey + Arc<FxHashSet> COW workers; lookup owned by Indexer;
 // find_matches_detailed / PrefixMatch; sweep_stale_nodes; no CleanupState /
 // metrics / early_exit path). Huawei modifications are also available under

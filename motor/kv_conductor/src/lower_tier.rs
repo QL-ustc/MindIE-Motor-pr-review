@@ -12,7 +12,7 @@
 // Local copy: licenses/Apache-2.0.txt
 // Attribution: THIRD_PARTY_NOTICES.md
 //
-// Modified by Huawei Technologies Co., Ltd. for MindIE-PyMotor KV Conductor
+// Modified by Huawei Technologies Co., Ltd. for MindIE-Motor KV Conductor
 // (RwLock + per-worker reverse index, ContiguousHit API, WorkerKey/medium
 // integration). Huawei modifications are also available under Mulan PSL v2
 // (http://license.coscl.org.cn/MulanPSL2). Redistribution of this file must

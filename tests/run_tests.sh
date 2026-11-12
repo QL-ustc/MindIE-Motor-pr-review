@@ -24,6 +24,9 @@ show_help() {
     echo "  --exclude=        Exclude files/directories from coverage (supports wildcards)"
     echo "  -k EXPRESSION     Only run tests matching the expression"
     echo ""
+    echo "Environment:"
+    echo "  PYTHON_BIN        Python executable used for dependency checks and pytest"
+    echo ""
     echo "Default exclusion rules:"
     echo "  - Test files: */tests/*"
     echo "  - Cache files: */__pycache__/*"
@@ -42,18 +45,16 @@ show_help() {
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Clean previous coverage data
-rm -f .coverage
-rm -rf htmlcov
-
 # Initialize variables
-PYTEST_ARGS=""
+PYTEST_ARGS=()
 COVERAGE_ENABLED=false
 COVERAGE_REPORT="term"
 COVERAGE_EXCLUDE=()
 PARALLEL_PROCESSES="6"  # Default to 6 parallel processes
 DISABLE_PARALLEL=false
 HAS_WARNINGS=false
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+export PYTHON_BIN
 
 # Default excluded files/directories (generated files, test files, etc.)
 DEFAULT_EXCLUDES=(
@@ -69,6 +70,7 @@ DEFAULT_EXCLUDES=(
 # Set PYTHONPATH
 export PYTHONPATH="$ROOT_DIR:$PYTHONPATH"
 export PYTHONPATH="$ROOT_DIR/motor:$PYTHONPATH"
+export PYTHONDONTWRITEBYTECODE=1
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -78,6 +80,10 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -n)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "Error: -n requires a process count." >&2
+                exit 2
+            fi
             PARALLEL_PROCESSES="$2"
             shift 2
             ;;
@@ -102,80 +108,133 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            PYTEST_ARGS="$PYTEST_ARGS $1"
+            PYTEST_ARGS+=("$1")
             shift
             ;;
     esac
 done
 
-# Check if required packages are installed
-check_dependencies() {
-    echo "Checking test dependencies..."
+# Coverage cleanup is an explicit --cov side effect and must happen only after
+# argument parsing, so --help and invalid invocations never delete user output.
+if [ "$COVERAGE_ENABLED" = true ]; then
+    rm -f .coverage
+    rm -rf htmlcov
+fi
 
-    # Check pytest related packages
-    python3 -c "import pytest" 2>/dev/null || { echo "Installing pytest..."; pip install pytest; }
-    python3 -c "import pytest_cov" 2>/dev/null || { echo "Installing pytest-cov..."; pip install pytest-cov; }
-    python3 -c "import pytest_asyncio" 2>/dev/null || { echo "Installing pytest-asyncio..."; pip install pytest-asyncio; }
-    python3 -c "import pytest_xdist" 2>/dev/null || { echo "Installing pytest-xdist..."; pip install pytest-xdist; }
-
-    # Check project core dependencies
-    echo "Checking project core dependencies..."
-    python3 -c "import fastapi; assert tuple(map(int, fastapi.__version__.split('.')[:2])) >= (0, 100)" 2>/dev/null || { echo "Installing fastapi..."; pip install 'fastapi>=0.100.0'; }
-    python3 -c "import uvicorn" 2>/dev/null || { echo "Installing uvicorn..."; pip install "uvicorn[standard]>=0.15.0"; }
-    python3 -c "import grpc" 2>/dev/null || { echo "Installing grpcio..."; pip install 'grpcio>=1.82.1'; }
-    python3 -c "import grpc_tools" 2>/dev/null || { echo "Installing grpcio-tools..."; pip install 'grpcio-tools>=1.82.1' 'protobuf>=7.35.1,<8.0.0'; }
-    python3 -c "import pydantic; assert int(pydantic.__version__.split('.', 1)[0]) == 2" 2>/dev/null || { echo "Installing pydantic..."; pip install 'pydantic>=2.0.0,<3.0.0'; }
-    python3 -c "from OpenSSL import crypto" 2>/dev/null || { echo "Installing pyOpenSSL..."; pip install pyOpenSSL>=21.0.0; }
-
-    # Check HTTP client libraries
-    echo "Checking HTTP client dependencies..."
-    python3 -c "import requests" 2>/dev/null || { echo "Installing requests..."; pip install requests>=2.25.0; }
-    python3 -c "import httpx" 2>/dev/null || { echo "Installing httpx..."; pip install httpx>=0.24.0; }
-
-    # Check other potentially needed test dependencies
-    python3 -c "import asyncio" 2>/dev/null || { echo "asyncio is not available, this may affect async tests"; }
-    python3 -c "import tempfile" 2>/dev/null || { echo "tempfile is not available, this may affect temporary file tests"; }
-
-    echo "Dependency check completed"
-}
-
-# Ensure dependency packages are installed
-check_dependencies
-
-# Generate protobuf files if needed
-generate_proto_files() {
-    echo "Checking and generating protobuf files..."
-    if [ -f "$ROOT_DIR/scripts/generate_proto.sh" ]; then
-        "$ROOT_DIR/scripts/generate_proto.sh"
-    else
-        echo "Warning: generate_proto.sh not found. Skipping protobuf generation."
-        echo "If you encounter import errors, please run: scripts/generate_proto.sh"
+# Check required packages without changing the selected Python environment.
+MISSING_DEPENDENCIES=()
+check_dependency() {
+    local import_statement="$1"
+    local package_spec="$2"
+    if ! "$PYTHON_BIN" -c "$import_statement" 2>/dev/null; then
+        MISSING_DEPENDENCIES+=("$package_spec")
     fi
 }
 
-generate_proto_files
+check_dependencies() {
+    echo "Checking test dependencies for $PYTHON_BIN..."
+    if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+        echo "Error: Python executable not found: $PYTHON_BIN" >&2
+        return 1
+    fi
+    if ! "$PYTHON_BIN" -c $'try:\n    import readline\nexcept ImportError:\n    pass' 2>/dev/null; then
+        echo "Error: Python runtime sanity check failed for $PYTHON_BIN (readline import)." >&2
+        echo "Select a healthy Python 3.10+ interpreter with PYTHON_BIN." >&2
+        return 1
+    fi
 
-# Build pytest command
-CMD="pytest"
+    check_dependency "import pytest" "pytest"
+    check_dependency "import pytest_asyncio" "pytest-asyncio"
+    if [ "$COVERAGE_ENABLED" = true ]; then
+        check_dependency "import pytest_cov" "pytest-cov"
+    fi
+    if [ "$DISABLE_PARALLEL" = false ]; then
+        check_dependency "import xdist" "pytest-xdist"
+    fi
+    check_dependency \
+        "import fastapi; assert tuple(map(int, fastapi.__version__.split('.')[:2])) >= (0, 100)" \
+        "fastapi>=0.100.0"
+    check_dependency "import uvicorn" "uvicorn[standard]>=0.15.0"
+    check_dependency "import grpc" "grpcio>=1.82.1"
+    check_dependency "import grpc_tools.protoc" "grpcio-tools>=1.82.1"
+    check_dependency "import google.protobuf" "protobuf>=7.35.1,<8.0.0"
+    check_dependency \
+        "import pydantic; assert int(pydantic.__version__.split('.', 1)[0]) == 2" \
+        "pydantic>=2.0.0,<3.0.0"
+    check_dependency "from OpenSSL import crypto" "pyOpenSSL>=21.0.0"
+    check_dependency "import requests" "requests>=2.31.0"
+    check_dependency "import httpx" "httpx>=0.24.0"
 
-# Enable color output (force color on since we're using tee which may interfere with auto-detection)
-# Check if color option is not already specified in PYTEST_ARGS
-if ! echo " $PYTEST_ARGS " | grep -qE " (--color=|--color )"; then
-    CMD="$CMD --color=yes"
+    if [ ${#MISSING_DEPENDENCIES[@]} -gt 0 ]; then
+        echo "Missing required Python dependencies for $PYTHON_BIN:" >&2
+        printf '  %s\n' "${MISSING_DEPENDENCIES[@]}" >&2
+        echo "Install requirements and test tools explicitly, then rerun this command:" >&2
+        echo "  $PYTHON_BIN -m pip install -r requirements.txt pytest pytest-cov pytest-xdist" >&2
+        return 1
+    fi
+    echo "Dependency check completed"
+}
+
+check_dependencies || exit 1
+
+# Keep generated protobuf modules and runner bookkeeping outside the worktree.
+HARNESS_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mindie-motor-tests.XXXXXX") || exit 1
+OUTPUT_FILE="$HARNESS_TEMP_DIR/pytest-output.log"
+PROTO_OUTPUT_DIR="$HARNESS_TEMP_DIR/generated-proto"
+SITE_CUSTOMIZE_DIR="$HARNESS_TEMP_DIR/site"
+
+cleanup() {
+    rm -rf "$HARNESS_TEMP_DIR"
+}
+trap cleanup EXIT
+
+mkdir -p "$PROTO_OUTPUT_DIR" "$SITE_CUSTOMIZE_DIR"
+cat > "$SITE_CUSTOMIZE_DIR/sitecustomize.py" <<'PY'
+import os
+
+from motor.common.etcd import proto
+
+proto.__path__.insert(0, os.environ["MOTOR_GENERATED_PROTO_DIR"])
+PY
+
+echo "Generating protobuf files in a temporary directory..."
+if ! "$ROOT_DIR/scripts/generate_proto.sh" --output-dir "$PROTO_OUTPUT_DIR"; then
+    echo "Error: protobuf generation failed." >&2
+    exit 1
+fi
+export MOTOR_GENERATED_PROTO_DIR="$PROTO_OUTPUT_DIR"
+export PYTHONPATH="$SITE_CUSTOMIZE_DIR:$PROTO_OUTPUT_DIR:$PYTHONPATH"
+
+# Build pytest command as an array so each user argument keeps its boundary.
+CMD=("$PYTHON_BIN" -m pytest "-o" "cache_dir=$HARNESS_TEMP_DIR/pytest-cache")
+
+# Enable color output (force color on since we're using tee which may interfere with auto-detection).
+HAS_COLOR_OPTION=false
+for pytest_arg in "${PYTEST_ARGS[@]}"; do
+    case "$pytest_arg" in
+        --color|--color=*)
+            HAS_COLOR_OPTION=true
+            break
+            ;;
+    esac
+done
+if [ "$HAS_COLOR_OPTION" = false ]; then
+    CMD+=("--color=yes")
 fi
 
 # If parallel execution is enabled and not disabled
 if [ "$DISABLE_PARALLEL" = false ] && [ -n "$PARALLEL_PROCESSES" ]; then
-    CMD="$CMD -n $PARALLEL_PROCESSES"
+    CMD+=("-n" "$PARALLEL_PROCESSES")
 fi
 
 # If coverage statistics are enabled
 if [ "$COVERAGE_ENABLED" = true ]; then
     # Create temporary .coveragerc configuration file
-    COVERAGERC_FILE=".coveragerc.tmp"
+    COVERAGERC_FILE="$HARNESS_TEMP_DIR/coveragerc"
     cat > "$COVERAGERC_FILE" << EOF
 [run]
 source = motor
+data_file = $HARNESS_TEMP_DIR/.coverage
 omit =
 EOF
 
@@ -191,15 +250,15 @@ EOF
     fi
 
     # Specify source code path and test path
-    CMD="$CMD --cov=motor --cov-report=$COVERAGE_REPORT --cov-config=$COVERAGERC_FILE"
+    CMD+=("--cov=motor" "--cov-report=$COVERAGE_REPORT" "--cov-config=$COVERAGERC_FILE")
 fi
 
 # Add other pytest arguments
-if [ ! -z "$PYTEST_ARGS" ]; then
-    CMD="$CMD $PYTEST_ARGS"
+if [ ${#PYTEST_ARGS[@]} -gt 0 ]; then
+    CMD+=("${PYTEST_ARGS[@]}")
 else
     # If no test path is specified, run all tests by default
-    CMD="$CMD tests/"
+    CMD+=("tests/")
 fi
 
 # Function: Parse and display test result summary
@@ -360,11 +419,9 @@ show_test_summary() {
 }
 
 # Execute test command
-echo "Executing command: $CMD"
-
-# Create temporary file to capture output
-OUTPUT_FILE=$(mktemp)
-trap "rm -f $OUTPUT_FILE" EXIT
+printf 'Executing command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
 
 # Ensure terminal width is detected correctly for progress alignment
 # Get terminal width, default to 80 if not available
@@ -372,7 +429,7 @@ TERM_WIDTH=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
 export COLUMNS=$TERM_WIDTH
 
 # Execute tests and capture output and exit code
-$CMD 2>&1 | tee "$OUTPUT_FILE"
+"${CMD[@]}" 2>&1 | tee "$OUTPUT_FILE"
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
 # Display test result summary
@@ -385,11 +442,6 @@ if [ $TEST_EXIT_CODE -eq 0 ]; then
     else
         echo "✓ All tests passed"
     fi
-fi
-
-# Clean up temporary files
-if [ -f ".coveragerc.tmp" ]; then
-    rm -f ".coveragerc.tmp"
 fi
 
 # Exit based on test results (warnings are reported but do not affect exit code)

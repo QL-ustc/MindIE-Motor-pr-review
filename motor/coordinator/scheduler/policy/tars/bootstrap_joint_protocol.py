@@ -77,7 +77,7 @@ class BootstrapJointFailureCode(str, Enum):
     ENGINE_TYPE_MISMATCH = "engine_type_mismatch"
     CIRCUIT_OPEN = "circuit_open"
     CAPACITY_EXHAUSTED = "capacity_exhausted"
-    DELIVERY_TOKEN_MISMATCH = "delivery_token_mismatch"
+    DELIVERY_TOKEN_MISMATCH = "delivery_token_mismatch"  # nosec B105 -- protocol error code
     ROUTER_LEDGER_CONFLICT = "router_ledger_conflict"
     PRECONFIRM_DISPATCH = "preconfirm_dispatch"
     BOUNDARY_FAILURE = "boundary_failure"

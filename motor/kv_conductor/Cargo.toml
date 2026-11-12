@@ -10,7 +10,7 @@
 
 [package]
 name = "kv-conductor"
-description = "KV Conductor - Radix tree based KV cache indexer for MindIE-PyMotor"
+description = "KV Conductor - Radix tree based KV cache indexer for MindIE-Motor"
 version = "0.1.0"
 edition = "2021"
 authors = ["MindIE Team"]

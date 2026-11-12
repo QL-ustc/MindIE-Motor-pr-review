@@ -8,7 +8,7 @@
 // MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PSL v2 for more details.
 
-//! KV Conductor — Standalone KV cache indexer service for MindIE-PyMotor.
+//! KV Conductor — Standalone KV cache indexer service for MindIE-Motor.
 //!
 //! Starts an HTTP server that maintains radix-tree-based KV cache indexes
 //! per (model, tenant) pair, answering overlap queries to guide cache-aware
@@ -25,7 +25,7 @@ use kv_conductor::indexer::CacheMaintenanceConfig;
 use kv_conductor::registry::WorkerRegistry;
 use kv_conductor::server::{create_router, AppState};
 
-/// KV Conductor — Radix-tree-based KV cache indexer for MindIE-PyMotor.
+/// KV Conductor — Radix-tree-based KV cache indexer for MindIE-Motor.
 #[derive(Parser, Debug)]
 #[command(name = "kv-conductor")]
 #[command(version = env!("CARGO_PKG_VERSION"))]

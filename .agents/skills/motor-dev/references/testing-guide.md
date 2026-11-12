@@ -28,6 +28,24 @@ bash tests/run_tests.sh -k "heartbeat" tests/
 bash tests/run_tests.sh --serial -s tests/node_manager/
 ```
 
+### Harness guarantees
+
+- `tests/run_tests.sh` uses one interpreter for dependency checks, protobuf generation, and pytest. Set it explicitly
+  with `PYTHON_BIN=/path/to/python3` when multiple Python installations exist.
+- Missing dependencies required by the selected mode fail fast with an installation hint. For example, serial runs do
+  not require xdist and non-coverage runs do not require pytest-cov. The runner never invokes `pip` or changes the
+  selected environment.
+- A lightweight runtime sanity check catches a broken optional `readline` extension before pytest starts and asks the
+  user to select a healthy Python 3.10+ interpreter.
+- Generated protobuf modules, pytest cache, bytecode, command output, and temporary coverage configuration stay in
+  a temporary directory that is removed on exit.
+- User arguments are stored as a Bash array, so expressions such as `-k "register or unregister"` retain their
+  argument boundary.
+- `--help` and invalid runner arguments have no cleanup, dependency-check, or protobuf-generation side effects.
+  Existing coverage output is removed only when a new `--cov` run is requested.
+- The gitleaks pre-commit hook remains offline. It accepts `GITLEAKS_BIN`, then checks the repository root and PATH;
+  a missing executable fails with setup guidance and never triggers an install or download.
+
 ## Test Coverage Requirements
 
 When adding new logic, create tests covering at minimum:

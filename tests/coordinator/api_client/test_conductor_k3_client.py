@@ -8,9 +8,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 from motor.common.resources.instance import Endpoint, Instance, PDRole
+from motor.config.coordinator import KvConductorConfig, SchedulerConfig
 from motor.coordinator.api_client.conductor_api_client import ConductorApiClient
 from motor.coordinator.api_client.conductor_evidence import ConductorSchemaError
-from motor.config.coordinator import KvConductorConfig, SchedulerConfig
 
 
 def _instance(instance_id=1, model="qwen", ranks=(0,)):
@@ -61,9 +61,9 @@ def _worker(instance_id, model, ranks, *, provenance=True):
 def test_pool_and_dp_registration_share_runtime_model_namespace():
     client = Mock()
     client.post.return_value = {"status": "ok"}
-    ConductorApiClient._pool_registered = False
 
     with (
+        patch.object(ConductorApiClient, "_pool_registered", False),
         patch.object(ConductorApiClient, "coordinator_config", _config()),
         patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as http,
     ):
@@ -115,19 +115,36 @@ def test_workers_endpoint_is_strict_and_never_falls_back_to_legacy_services():
 
 def test_conductor_restart_rebuilds_pool_and_every_missing_dp_cold():
     instance = _instance(model="qwen", ranks=(0, 1))
-    ConductorApiClient._pool_registered = True
+    client = Mock()
+    client.post.return_value = {"status": "ok"}
 
     with (
+        patch.object(ConductorApiClient, "_pool_registered", True),
         patch.object(ConductorApiClient, "coordinator_config", _config()),
         patch.object(ConductorApiClient, "get_registered_services", return_value=[]),
-        patch.object(ConductorApiClient, "_register_pool") as register_pool,
-        patch.object(ConductorApiClient, "register_post") as register_dp,
+        patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as http,
     ):
+        http.return_value.__enter__.return_value = client
         ConductorApiClient.re_register_kv_instances([instance])
+        assert ConductorApiClient._pool_registered is True
 
-    register_pool.assert_called_once()
-    assert register_pool.call_args.args[2] == "qwen"
-    assert {call.args[2] for call in register_dp.call_args_list} == {0, 1}
+    posts = client.post.call_args_list
+    assert len(posts) == 3
+    assert all(call.args[0] == "/register" for call in posts)
+    payloads = [call.args[1] for call in posts]
+    assert {(payload["instance_id"], payload["dp_rank"]) for payload in payloads} == {
+        ("mooncake-pool", 0),
+        ("vllm-prefill-1", 0),
+        ("vllm-prefill-1", 1),
+    }
+    assert {payload["modelname"] for payload in payloads} == {"qwen"}
+    assert all(payload["block_size"] == 128 for payload in payloads)
+    dp_payloads = [payload for payload in payloads if payload["instance_id"] == "vllm-prefill-1"]
+    assert {payload["medium_endpoints"]["npu"] for payload in dp_payloads} == {
+        "tcp://10.0.0.1:50090",
+        "tcp://10.0.0.1:50091",
+    }
+    assert all(not payload.get("exact_dp_npu_provenance", False) for payload in payloads)
 
 
 def test_namespace_conflict_aborts_reconciliation_without_mutation():
@@ -137,8 +154,12 @@ def test_namespace_conflict_aborts_reconciliation_without_mutation():
     with (
         patch.object(ConductorApiClient, "coordinator_config", _config("YuanRong")),
         patch.object(ConductorApiClient, "get_registered_services", return_value=[conflict]),
-        patch.object(ConductorApiClient, "register_post") as register_dp,
+        patch.object(ConductorApiClient, "_yuanrong_nodes_registered", {"existing-node"}),
+        patch.object(ConductorApiClient, "_pool_registered", True),
+        patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as http,
     ):
         ConductorApiClient.re_register_kv_instances([instance])
+        assert ConductorApiClient._yuanrong_nodes_registered == {"existing-node"}
+        assert ConductorApiClient._pool_registered is True
 
-    register_dp.assert_not_called()
+    http.assert_not_called()

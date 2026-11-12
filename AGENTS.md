@@ -82,6 +82,9 @@ bash tests/run_tests.sh
 bash tests/run_tests.sh --cov tests/
 ```
 
+`run_tests.sh` 不会自动安装依赖；缺失时会 fail-fast。多 Python 环境可通过
+`PYTHON_BIN=/path/to/python3 bash tests/run_tests.sh ...` 固定检查、proto 生成和 pytest 使用的解释器。
+
 - 测试目录镜像源码结构：`motor/config/foo.py` → `tests/config/test_foo.py`
 - 写测试前先读 `.agents/skills/motor-dev/references/testing-guide.md` 的四条设计原则
 

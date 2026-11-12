@@ -27,7 +27,6 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
 def _build_instance(role: PDRole) -> Mock:
     instance = Mock()
     instance.role = role
-    instance.model_name = "qwen3-8B"
     endpoint = Mock()
     instance.endpoints = {"pod-0": {0: endpoint}}
     instance.get_all_endpoints.return_value = (endpoint,)
@@ -159,6 +158,8 @@ def test_register_kv_instance_supports_role_u() -> None:
         _build_instance(PDRole.ROLE_U),
         _build_instance(PDRole.ROLE_D),
     ]
+    for instance in instances:
+        instance.model_name = "qwen3-8B"
     with (
         patch.object(ConductorApiClient, "_kv_reg", return_value=_mock_enabled_kv_reg()),
         patch.object(ConductorApiClient, "_register_hbm_dp") as mock_hbm_dp,

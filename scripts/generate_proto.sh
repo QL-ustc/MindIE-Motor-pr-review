@@ -9,114 +9,94 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-# Script to generate Python code from .proto files
-# This script generates _pb2.py and _pb2_grpc.py files from .proto files
-#
-# Example .proto file structure (motor/common/etcd/proto/kv.proto):
-#   syntax = "proto3";
-#   package motor.common.etcd.proto;
-#
-#   message KVPair {
-#     string key = 1;
-#     string value = 2;
-#   }
-#
-#   service KVService {
-#     rpc Get(KVPair) returns (KVPair);
-#     rpc Put(KVPair) returns (KVPair);
-#   }
+# Generate Python modules from the etcd .proto files. The default output stays
+# beside the sources for packaging. Tests use --output-dir to avoid source-tree
+# artifacts.
 
-set -e  # Exit on error
+set -e
 
-# Get the project root directory
+show_help() {
+    echo "Usage: $0 [--output-dir DIR]"
+    echo "  --output-dir DIR  Write generated modules to DIR instead of the source tree"
+}
+
+OUTPUT_DIR=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --output-dir)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "Error: --output-dir requires a directory." >&2
+                exit 2
+            fi
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        *)
+            echo "Error: unknown argument: $1" >&2
+            show_help >&2
+            exit 2
+            ;;
+    esac
+done
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT_DIR"
+PROTO_DIR="$ROOT_DIR/motor/common/etcd/proto"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# Check if grpcio-tools is installed
-if ! python -c "import grpc_tools.protoc" 2>/dev/null; then
-    echo "Error: grpcio-tools is not installed."
-    echo "Please install it with: pip install 'grpcio-tools>=1.82.1' 'protobuf>=7.35.1,<8.0.0'"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Error: Python executable not found: $PYTHON_BIN" >&2
+    exit 1
+fi
+if ! "$PYTHON_BIN" -c "import grpc_tools.protoc" 2>/dev/null; then
+    echo "Error: grpcio-tools is not installed for $PYTHON_BIN." >&2
+    echo "Install the project requirements explicitly before generating protobuf files." >&2
     exit 1
 fi
 
-# Find all .proto files (excluding venv and other common virtual environment directories)
-PROTO_FILES=$(find . -type d \( -name "venv" -o -name ".venv" -o -name "env" -o -name ".env" -o -name "__pycache__" -o -name "node_modules" \) -prune -o -name "*.proto" -type f -print)
-
-if [ -z "$PROTO_FILES" ]; then
-    echo "No .proto files found."
+PROTO_FILES=("$PROTO_DIR"/*.proto)
+if [ ! -e "${PROTO_FILES[0]}" ]; then
+    echo "No .proto files found in $PROTO_DIR."
     exit 0
 fi
 
-# Generate Python code for each .proto file
-for proto_file in $PROTO_FILES; do
-    echo "Generating code from $proto_file..."
+rewrite_generated_imports() {
+    local generated_file="$1"
+    local package_path="$2"
+    "$PYTHON_BIN" - "$generated_file" "$package_path" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-    # Get the directory containing the .proto file
-    proto_dir=$(dirname "$proto_file")
+path = Path(sys.argv[1])
+package = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+pattern = re.compile(r"^import ([A-Za-z0-9_]+_pb2)( as [A-Za-z0-9_]+)?$", re.MULTILINE)
+text = pattern.sub(lambda match: f"from {package} import {match.group(1)}{match.group(2) or ''}", text)
+path.write_text(text, encoding="utf-8")
+PY
+}
 
-    # Get the base name of the .proto file (without extension)
-    proto_base=$(basename "$proto_file" .proto)
+PACKAGE_PATH="motor.common.etcd.proto"
+for proto_file in "${PROTO_FILES[@]}"; do
+    proto_base="$(basename "$proto_file" .proto)"
+    target_dir="${OUTPUT_DIR:-$PROTO_DIR}"
+    mkdir -p "$target_dir"
+    echo "Generating code from $proto_file into $target_dir..."
 
-    # Generate _pb2.py and _pb2_grpc.py files
-    # Change to proto directory for protoc execution (protoc requires proto_path to match file location)
-    cd "$proto_dir"
-    python -m grpc_tools.protoc \
-        --proto_path="." \
-        --python_out="." \
-        --grpc_python_out="." \
+    "$PYTHON_BIN" -m grpc_tools.protoc \
+        --proto_path="$PROTO_DIR" \
+        --python_out="$target_dir" \
+        --grpc_python_out="$target_dir" \
         "$(basename "$proto_file")"
-    cd "$ROOT_DIR"
 
-    if [ $? -eq 0 ]; then
-        echo "✓ Successfully generated code from $proto_file"
-
-        # Fix import paths in _pb2_grpc.py if it exists
-        pb2_grpc_file="${proto_dir}/${proto_base}_pb2_grpc.py"
-        if [ -f "$pb2_grpc_file" ]; then
-            # Get the Python package path (e.g., motor/common/etcd/proto/kv.proto -> motor.common.etcd.proto)
-            # Remove leading ./ and .proto extension, get directory path, then convert / to .
-            proto_rel_path=$(echo "$proto_file" | sed 's|^\./||' | sed 's|\.proto$||')
-            package_path=$(dirname "$proto_rel_path" | sed 's|/|.|g')
-            if [ "$package_path" = "." ]; then
-                package_path=""
-            fi
-
-            # Replace relative import with absolute import
-            # Pattern: import kv_pb2 -> from motor.common.etcd.proto import kv_pb2
-            # Use sed with word boundary to avoid double replacement
-            if [ -n "$package_path" ]; then
-                # First check if already replaced to avoid double replacement
-                if ! grep -q "^from ${package_path} import ${proto_base}_pb2" "$pb2_grpc_file"; then
-                    sed -i "s|^import ${proto_base}_pb2\([^_]\)|from ${package_path} import ${proto_base}_pb2\1|g" "$pb2_grpc_file"
-                    sed -i "s|^import ${proto_base}_pb2 as|from ${package_path} import ${proto_base}_pb2 as|g" "$pb2_grpc_file"
-                fi
-            fi
-
-            echo "  Fixed import paths in ${proto_base}_pb2_grpc.py"
-        fi
-
-        pb2_file="${proto_dir}/${proto_base}_pb2.py"
-        if [ -f "$pb2_file" ]; then
-            proto_rel_path=$(echo "$proto_file" | sed 's|^\./||' | sed 's|\.proto$||')
-            package_path=$(dirname "$proto_rel_path" | sed 's|/|.|g')
-            [ "$package_path" = "." ] && package_path=""
-
-            if [ -n "$package_path" ]; then
-                # regex to match 'import xxx_pb2' not followed by more word chars (avoid matching xxx_pb2_extra)
-                # Also handle 'as' alias
-                if ! grep -q "^from ${package_path} import [a-zA-Z0-9_]*_pb2" "$pb2_file"; then
-                    # Replace plain imports: import b_pb2 -> from pkg import b_pb2
-                    sed -i "s|^import \([a-zA-Z0-9_]*_pb2\)\([^_a-zA-Z0-9].*\)\?$|from ${package_path} import \1\2|g" "$pb2_file"
-                    # Replace aliased imports: import b_pb2 as c -> from pkg import b_pb2 as c
-                    sed -i "s|^import \([a-zA-Z0-9_]*_pb2\) as \(.*\)$|from ${package_path} import \1 as \2|g" "$pb2_file"
-                fi
-            fi
-            echo "  Fixed import paths in ${proto_base}_pb2.py"
-        fi
-    else
-        echo "✗ Failed to generate code from $proto_file"
-        exit 1
-    fi
+    pb2_file="$target_dir/${proto_base}_pb2.py"
+    pb2_grpc_file="$target_dir/${proto_base}_pb2_grpc.py"
+    [ ! -f "$pb2_file" ] || rewrite_generated_imports "$pb2_file" "$PACKAGE_PATH"
+    [ ! -f "$pb2_grpc_file" ] || rewrite_generated_imports "$pb2_grpc_file" "$PACKAGE_PATH"
 done
 
 echo "All protobuf files generated successfully."

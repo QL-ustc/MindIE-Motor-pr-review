@@ -61,6 +61,7 @@
 | 2026-08-24 | coordinator | 实例注册接受 ID 碰撞和不完整引擎就绪 | [instance-registration-validation.md](coordinator/instance-registration-validation.md) | CRC32 collision, instance ID, Endpoint extra fields, empty models |
 | 2026-08-24 | coordinator | Coordinator models 与 domain 包循环导入 | [domain-model-circular-import.md](coordinator/domain-model-circular-import.md) | circular import, domain __init__, models.request, lazy exports |
 | 2026-08-25 | controller | 增量实例刷新失败后未及时收敛 | [incremental-refresh-set-fallback.md](controller/incremental-refresh-set-fallback.md) | EventPusher, incremental refresh, SET reconciliation, fingerprint |
+| 2026-08-28 | test-harness | 测试启动脚本修改环境、破坏参数边界并污染源码树 | [non-hermetic-test-runner.md](test-harness/non-hermetic-test-runner.md) | run_tests.sh, PYTHON_BIN, pytest-xdist, FSEvents, PollingObserver |
 | 2026-08-28 | kv_conductor | vLLM 0.23 固定位置事件中的 nil 导致字段错位 | [vllm-fixed-position-nil-events.md](kv_conductor/vllm-fixed-position-nil-events.md) | kv_conductor, vLLM 0.23, msgspec, nil placeholder, BlockStored |
 | 2026-08-28 | kv_conductor | 重复注册产生 DP 别名和跨 DP 缓存清理 | [registration-dp-lifecycle.md](kv_conductor/registration-dp-lifecycle.md) | kv_conductor, exact DP, idempotent registration, stale IP index, subscriber lock |
 | 2026-08-28 | kv_conductor | 不兼容或非精确事件被误当成可调度 DP 证据 | [conductor-evidence-provenance.md](kv_conductor/conductor-evidence-provenance.md) | kv_conductor, exact_dp_npu_provenance, coverage metadata, JSON/MessagePack, fallback boundary |
@@ -69,6 +70,7 @@
 | 2026-08-28 | coordinator | 统一分配流程破坏 Trigger 与 PDHybrid 的真实时序 | [tars-single-role-mode-timing.md](coordinator/tars-single-role-mode-timing.md) | TARS, Trigger, PDHybrid, D-first, prefill_complete |
 | 2026-08-29 | coordinator | Handoff 分配缺少可证明的确认、响应丢失对账与超时边界 | [tars-handoff-confirmation-boundary.md](coordinator/tars-handoff-confirmation-boundary.md) | TARS, Handoff, paired roles, generation-bound SHM receipt, replay, bounded drain |
 | 2026-08-29 | coordinator | Bootstrap 分腿分配可能暴露不完整 P/D 所有权 | [tars-bootstrap-joint-visibility.md](coordinator/tars-bootstrap-joint-visibility.md) | TARS, Bootstrap, P/D atomic visibility, joint delivery, reverse compensation |
+| 2026-08-31 | test-harness | 旧产品名门禁把自身规则和测试样例判为迁移违规 | [legacy-name-gate-self-match.md](test-harness/legacy-name-gate-self-match.md) | migration path gate, self-match, unified diff, allowlist, product rename |
 | 2026-09-02 | controller | A2 linkdown 被降成 L2 无法自杀 | [a2-linkdown-nm-suicide.md](controller/a2-linkdown-nm-suicide.md) | A2, linkdown, 0x81078603, NmSuicide, PreSeparateNPU |
 | 2026-09-03 | coordinator | Responses input items were rejected by Chat message validation | [responses-developer-role-rejected.md](coordinator/responses-developer-role-rejected.md) | coordinator, responses, input-item, developer-role, function-call-output, validation, HTTP-400 |
 | 2026-09-04 | coordinator | SHM CAS 分配成功后被取消，active_tokens 永久泄漏 | [workload-ledger-orphan-leak.md](coordinator/workload-ledger-orphan-leak.md) | active_tokens leak, CancelledError, cas_add rollback, pop_residual_workloads |
