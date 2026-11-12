@@ -34,6 +34,13 @@ PD_HYBRID_REQUIRED_DEPLOY_KEYS = {
     C.HYBRID_POD_NPU_NUM,
 }
 
+_TARS_SCHEDULER = "tars"
+_ENGINE_CONFIG_SECTIONS = (
+    "motor_engine_prefill_config",
+    "motor_engine_decode_config",
+    "motor_engine_union_config",
+)
+
 
 reserved_labels: dict[str, bool] = {"app": True}  # True 表示禁止用户通过 additional_labels 覆盖该标签
 
@@ -170,6 +177,65 @@ def validate_pd_hybrid_config(user_config):
         raise ValueError("PD hybrid config requires motor_engine_union_config.")
     if C.MOTOR_ENGINE_PREFILL_CONFIG in user_config or "motor_engine_decode_config" in user_config:
         raise ValueError("PD hybrid config cannot include prefill/decode engine config sections.")
+
+
+def validate_tars_deploy_config(user_config):
+    """Enforce the initial public TARS deployment support envelope."""
+    coordinator = user_config.get(C.MOTOR_COORDINATOR_CONFIG, {})
+    scheduler = coordinator.get("scheduler_config", {}) if isinstance(coordinator, dict) else {}
+    # Match Coordinator's migration: explicit role fields override the legacy default.
+    legacy_type = scheduler.get("scheduler_type", "load_balance")
+    prefill_tars = scheduler.get("prefill_scheduler_type", legacy_type) == _TARS_SCHEDULER
+    decode_tars = scheduler.get("decode_scheduler_type", legacy_type) == _TARS_SCHEDULER
+    if prefill_tars != decode_tars:
+        raise ValueError("TARS requires prefill_scheduler_type and decode_scheduler_type to both be 'tars'")
+    if not prefill_tars:
+        return
+
+    standby = coordinator.get(C.STANDBY_CONFIG, {})
+    if standby.get(C.ENABLE_MASTER_STANDBY, False):
+        raise ValueError("TARS requires one active Coordinator; master-standby is not supported")
+
+    conductor = user_config.get(C.KV_CONDUCTOR_CONFIG)
+    if not isinstance(conductor, dict):
+        raise ValueError("TARS requires top-level kv_conductor_config")
+    port = conductor.get(C.KV_CONDUCTOR_PORT)
+    if not isinstance(port, int) or isinstance(port, bool) or port <= 0:
+        raise ValueError("TARS kv_conductor_config.http_server_port must be a positive integer")
+    conductor_block_size = conductor.get("block_size", 128)
+    if not isinstance(conductor_block_size, int) or isinstance(conductor_block_size, bool) or conductor_block_size <= 0:
+        raise ValueError("TARS kv_conductor_config.block_size must be a positive integer")
+
+    model_ids = set()
+    for section_name in _ENGINE_CONFIG_SECTIONS:
+        section = user_config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        engine = section.get("engine_config", {})
+        if not isinstance(engine, dict):
+            raise ValueError(f"TARS {section_name}.engine_config must be an object")
+        model = _engine_model_identity(engine)
+        if model:
+            model_ids.add(model)
+        block_size = engine.get("block-size", engine.get("block_size", 128))
+        if block_size != conductor_block_size:
+            raise ValueError(
+                f"TARS requires one block size: {section_name}={block_size}, kv_conductor_config={conductor_block_size}"
+            )
+    if len(model_ids) != 1:
+        raise ValueError(f"TARS requires exactly one model identity, got {sorted(model_ids)}")
+
+
+def _engine_model_identity(engine_config):
+    for key in ("served_model_name", "served-model-name", "model", "model-path"):
+        value = engine_config.get(key)
+        if isinstance(value, list):
+            if len(value) != 1 or not isinstance(value[0], str) or not value[0]:
+                raise ValueError("TARS requires exactly one served model per engine")
+            return value[0]
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def validate_pd_hybrid_infer_service_template(user_config, infer_service_template_path):

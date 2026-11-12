@@ -39,6 +39,7 @@ nav:
           - PD 分离: user_guide/features/pd_disaggregation.md
           - 动态分桶调度: user_guide/features/dynamic_bucket.md
           - KV Cache 亲和: user_guide/features/kvcache_affinity.md
+          - TARS 调度: user_guide/features/tars_scheduler.md
           - Agent Hint 会话亲和与调度: user_guide/features/agent_hint.md
           - KV Cache Store:
               - 概述: user_guide/features/kv_cache_store/README.md
@@ -88,6 +89,7 @@ nav:
           - 精度检测: design/fault_tolerance/precision_detection.md
       - KV Conductor: design/kv_conductor.md
       - Coordinator 调度热路径 Rust 重构: design/coordinator_scheduler_rust.md
+      - TARS 集成: design/tars_mindie_integration.md
       - 扩缩容: design/scaling.md
       - CRD 部署设计: design/crd_deployment.md
       - Metrics 可观测性: design/metrics.md

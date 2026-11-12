@@ -1,0 +1,90 @@
+{
+  "version": "v2.0",
+  "motor_deploy_config": {
+    "p_instances_num": 2,
+    "d_instances_num": 2,
+    "single_p_instance_pod_num": 1,
+    "single_d_instance_pod_num": 1,
+    "p_pod_npu_num": 4,
+    "d_pod_npu_num": 4,
+    "image_name": "<current-mindie-motor-image>",
+    "job_id": "mindie-motor-tars-kv-pool-dp2",
+    "hardware_type": "800I_A2",
+    "weight_mount_path": "/mnt/weight/",
+    "deploy_mode": "multi_deployment"
+  },
+  "motor_controller_config": {},
+  "motor_coordinator_config": {
+    "standby_config": {
+      "enable_master_standby": false
+    },
+    "scheduler_config": {
+      "prefill_scheduler_type": "tars",
+      "decode_scheduler_type": "tars",
+      "tars": {
+        "fallback_policy": "load_balance"
+      }
+    }
+  },
+  "kv_cache_store_config": {
+    "backend": "mooncake",
+    "port": 50088,
+    "eviction_high_watermark_ratio": 0.9,
+    "eviction_ratio": 0.1
+  },
+  "kv_conductor_config": {
+    "conductor_service": "kv-conductor",
+    "http_server_port": 13333,
+    "store_backend": "Mooncake",
+    "model_path": "qwen3-8B",
+    "block_size": 128,
+    "engine_type": "vLLM",
+    "pool_endpoint": "tcp://mindie-motor-kv-store.mindie-motor-tars-kv-pool-dp2.svc.cluster.local:50088"
+  },
+  "motor_engine_prefill_config": {
+    "engine_type": "vllm",
+    "motor_nodemanger_config": {},
+    "engine_config": {
+      "served_model_name": "qwen3-8B",
+      "model": "/mnt/weight/qwen3_8B",
+      "data_parallel_size": 2,
+      "tensor_parallel_size": 2,
+      "pipeline_parallel_size": 1,
+      "data_parallel_rpc_port": 9000,
+      "block-size": 128,
+      "max_model_len": 2048,
+      "kv_transfer_config": {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "kv_producer",
+        "kv_parallel_size": 2,
+        "kv_port": "30001",
+        "engine_id": "0",
+        "kv_rank": 0,
+        "kv_connector_extra_config": {}
+      }
+    }
+  },
+  "motor_engine_decode_config": {
+    "engine_type": "vllm",
+    "motor_nodemanger_config": {},
+    "engine_config": {
+      "served_model_name": "qwen3-8B",
+      "model": "/mnt/weight/qwen3_8B",
+      "data_parallel_size": 2,
+      "tensor_parallel_size": 2,
+      "pipeline_parallel_size": 1,
+      "data_parallel_rpc_port": 9000,
+      "block-size": 128,
+      "max_model_len": 2048,
+      "kv_transfer_config": {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "kv_consumer",
+        "kv_parallel_size": 2,
+        "kv_port": "30001",
+        "engine_id": "0",
+        "kv_rank": 0,
+        "kv_connector_extra_config": {}
+      }
+    }
+  }
+}

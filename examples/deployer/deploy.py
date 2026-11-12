@@ -62,6 +62,7 @@ from lib.config_validator import (
     resolve_config_paths,
     validate_pd_hybrid_config,
     validate_pd_hybrid_infer_service_template,
+    validate_tars_deploy_config,
     validate_node_selectors,
     validate_reserved_labels,
 )
@@ -311,6 +312,7 @@ def resolve_deploy_mode_for_services(deploy_config):
 
 
 def deploy_services(user_config, env_config_path, dry_run=False, auto_log_collect=False):
+    validate_tars_deploy_config(user_config)
     sync_decode_first_token_timeout_from_env(user_config, env_config_path)
     deploy_config = user_config[C.MOTOR_DEPLOY_CONFIG]
     update_kv_store_enabled_flag(user_config)
@@ -577,6 +579,7 @@ def main():
 
     os.makedirs(C.OUTPUT_ROOT_PATH, exist_ok=True)
     validate_reserved_labels(user_config)
+    validate_tars_deploy_config(user_config)
     validate_container_snapshot_config(user_config)
     if C.HYBRID_INSTANCES_NUM in user_config.get(C.MOTOR_DEPLOY_CONFIG, {}):
         validate_pd_hybrid_config(user_config)

@@ -200,6 +200,28 @@
         "w_cpu": 1.0,
         "w_disk": 0.0,
         "hit_rate_threshold": 0.0
+      },
+      "tars": {
+        "fallback_policy": "load_balance",
+        "enable_decision_log": false,
+        "balance_type": "tars",
+        "prefill_tpot": 0.000127,
+        "tpct": null,
+        "tprt": 0.0,
+        "ttft_slo": 5.0,
+        "dh_first_balance_ttft_threshold": null,
+        "pending_token_capacity": 1000000,
+        "running_block_capacity": 65536,
+        "decode_token_capacity": 1000000,
+        "queue_wait_s": 1.0,
+        "final_query_s": 1.0,
+        "exact_commit_s": 1.0,
+        "settlement_margin_s": 1.0,
+        "server_timeout_s": 5.0,
+        "client_timeout_s": 6.0,
+        "delivery_lease_s": 10.0,
+        "drain_timeout_s": 30.0,
+        "recovery_cooldown_s": 30.0
       }
     },
     "render_config": {

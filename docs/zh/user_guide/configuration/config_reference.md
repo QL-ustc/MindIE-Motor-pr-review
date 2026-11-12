@@ -341,6 +341,28 @@ motor_coordinator_config字段配置样例如下所示：
       "w_disk": 0.0,
       "hit_rate_threshold": 0.0
     },
+    "tars": {
+      "fallback_policy": "load_balance",
+      "enable_decision_log": false,
+      "balance_type": "tars",
+      "prefill_tpot": 0.000127,
+      "tpct": null,
+      "tprt": 0.0,
+      "ttft_slo": 5.0,
+      "dh_first_balance_ttft_threshold": null,
+      "pending_token_capacity": 1000000,
+      "running_block_capacity": 65536,
+      "decode_token_capacity": 1000000,
+      "queue_wait_s": 1.0,
+      "final_query_s": 1.0,
+      "exact_commit_s": 1.0,
+      "settlement_margin_s": 1.0,
+      "server_timeout_s": 5.0,
+      "client_timeout_s": 6.0,
+      "delivery_lease_s": 10.0,
+      "drain_timeout_s": 30.0,
+      "recovery_cooldown_s": 30.0
+    },
     "kv_conductor_config": {
       "conductor_service": "",
       "http_server_port": 13333,
@@ -533,8 +555,8 @@ motor_coordinator_config字段配置样例如下所示：
 | base_timeout_s | float | 首次熔断时长（秒），也是熔断时长指数退避的基数；每次重新熔断/探活失败按 `2^(熔断次数-1)` 倍增长。默认值：`30.0`。 |
 | max_timeout_s | float | 熔断时长上限（秒）。默认值：`300.0`。 |
 | **scheduler_config字段** |-|-|
-| prefill_scheduler_type | string | Prefill / encode / union 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin` / `kv_cache_affinity`；不支持 `dynamic_bucket`。 |
-| decode_scheduler_type | string | Decode 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin` / `dynamic_bucket`，动态分桶详见[动态分桶调度](../features/dynamic_bucket.md)。枚举也接受 `kv_cache_affinity`，但 Decode 实例仍按 load_balance 选择并在启动时打印 warning。 |
+| prefill_scheduler_type | string | Prefill / encode / union 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin` / `kv_cache_affinity` / `tars`；不支持 `dynamic_bucket`。TARS 要求 P/D 两个类型字段同时设为 `tars`，并部署 KV Conductor，见 [TARS 调度](../features/tars_scheduler.md)。 |
+| decode_scheduler_type | string | Decode 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin` / `dynamic_bucket` / `tars`，TARS 要求 `prefill_scheduler_type` 同时为 `tars`；动态分桶详见[动态分桶调度](../features/dynamic_bucket.md)。枚举也接受 `kv_cache_affinity`，但 Decode 实例仍按 load_balance 选择并在启动时打印 warning。 |
 | scheduler_type | string | **已废弃**。存量配置仍可使用，读取时把值迁移到未单独配置的 `prefill_scheduler_type` 和 `decode_scheduler_type` 并打 warning。由于 Prefill 不支持 `dynamic_bucket`，动态分桶必须改用 `decode_scheduler_type` 单独配置。 |
 | enable_pd_separation_fallback_to_hybrid | bool | PD 分离场景下，当不存在兼容且未熔断的 P/D pair 时，是否允许降级使用混部路由，默认值为 `true`。候选优先级为 Union → Prefill → Decode；Decode 兜底仅适用于上报 `decode_colocation` capability 的 vLLM 实例，关闭后无兼容 pair 时返回 503。 |
 | endpoint_instance_score_weight | float | endpoint 优先负载均衡时实例平均负载权重。默认值：`0.05`。 |
@@ -549,14 +571,32 @@ motor_coordinator_config字段配置样例如下所示：
 | kv_affinity | object | KV Cache 亲和性调度参数（见下表） |
 | **kv_affinity 字段** |-|-|
 | mode | string | 任一 role 使用 `kv_cache_affinity` 时的子策略：`unified`（默认）或 `load_gated`。 |
-| load_weight | float | unified 模式下 endpoint 实时负载权重。默认值：`1.0`。 |
-| overlap_credit | float | 缓存前缀对 prefill 成本的折扣系数。默认值：`1.0`。 |
-| prefill_load_scale | float | unified 模式下（经亲和折扣后的）prefill 成本权重。默认值：`1.0`。 |
-| load_gate_topn | int | load_gated 模式下先保留负载最低的 N 个 endpoint 再做亲和择优；`0` 时回退为 `2`。默认值：`0`。 |
-| w_npu | float | 互斥 NPU 命中块权重。默认值：`1.0`。 |
-| w_cpu | float | 互斥 CPU 命中块权重。默认值：`1.0`。 |
-| w_disk | float | 互斥 Disk 命中块权重。默认值：`0.0`。 |
+| load_weight | float | unified 模式下 endpoint 实时负载权重。默认值：`1.0` |
+| overlap_credit | float | 缓存前缀对 prefill 成本的折扣系数。默认值：`1.0` |
+| prefill_load_scale | float | unified 模式下（经亲和折扣后的）prefill 成本权重。默认值：`1.0` |
+| load_gate_topn | int | load_gated 模式下先保留负载最低的 N 个 endpoint 再做亲和择优；`0` 时回退为 `2`。默认值：`0` |
+| w_npu | float | 互斥 NPU 命中块权重。默认值：`1.0` |
+| w_cpu | float | 互斥 CPU 命中块权重。默认值：`1.0` |
+| w_disk | float | 互斥 Disk 命中块权重。默认值：`0.0` |
 | hit_rate_threshold | float | 亲和性命中率门槛，取值 `[0, 1]`。默认 `0` 只关闭该门槛，其他回退仍生效。大于 0 时，全部候选的最大加权前缀命中率必须 **严格大于** 该阈值；相等也回退 `load_balance`，`1` 始终回退。门槛在 `load_gated` 筛选之前计算，不保证最终 endpoint 自身超过阈值。 |
+| **tars 字段** |-|`prefill_scheduler_type=tars` 且 `decode_scheduler_type=tars` 时生效；所有字段修改后均需重启 Coordinator。|
+| fallback_policy | string | 精确 Conductor 证据在 admission 开始前不可用时的降级策略：`load_balance`（默认）或 `round_robin`。|
+| enable_decision_log | bool | 是否记录不含 prompt/token 的 TARS 决策日志。默认值：`false`。|
+| balance_type | string | 固定为 `tars`。|
+| prefill_tpot | float | 原始 TARS Prefill 单 token 代价。默认值：`0.000127`。|
+| tpct | float/null | 显式 Prefill compute token 代价；`null` 时使用 `prefill_tpot`。|
+| tprt | float | 单个运行 block 的等待代价。默认值：`0.0`。|
+| ttft_slo | float | TTFT 目标，单位秒。默认值：`5.0`。|
+| dh_first_balance_ttft_threshold | float/null | 双哈希首次均衡阈值；`null` 时由 TTFT 和 TPCT 推导。|
+| pending_token_capacity | int | 每个 TARS target 的 pending token 容量。默认值：`1000000`。|
+| running_block_capacity | int | 每个 TARS target 的 running block 容量。默认值：`65536`。|
+| decode_token_capacity | int | 每个 Decode target 的 token 容量。默认值：`1000000`。|
+| queue_wait_s / final_query_s / exact_commit_s / settlement_margin_s | float | Scheduler admission 各阶段预算，默认均为 `1.0` 秒。四者之和必须小于 `server_timeout_s`。|
+| server_timeout_s | float | Scheduler 端操作总超时，默认值：`5.0` 秒。|
+| client_timeout_s | float | Router RPC 超时，必须大于 server timeout；默认值：`6.0` 秒。|
+| delivery_lease_s | float | 未确认交付租约，必须大于 client timeout；默认值：`10.0` 秒。|
+| drain_timeout_s | float | 停止 admission 后的排空预算，必须大于 delivery lease；默认值：`30.0` 秒。|
+| recovery_cooldown_s | float | 恢复隔离冷却参数，默认值：`30.0` 秒；初始公开版本不声明非优雅恢复。|
 | **inference_workers_config字段** |-|-|
 | num_workers | int | Coordinator中业务面worker个数，默认值：4。 |
 | worker_metaserver_base_port | int | vLLM layerwise/trigger PD 时每个 Inference Worker 的 metaserver 起始端口。默认值：`12000`。Worker `i` 监听 `base+i`，仅暴露 `POST /v1/metaserver`。设为 `0` 关闭。须保证 `base+num_workers-1 <= 65535`。同一集群不可混部 handoff 与 trigger。监听地址优先 `POD_IP`，否则用 `coordinator_api_host`（不绑 loopback）。`coordinator_api_host=0.0.0.0`/`::` 仍可启动；走 Trigger 时须有 `POD_IP` 或可达的 `coordinator_api_host`，否则该请求返回 503。端口占用或 metaserver 启动失败时推理口继续服务，该 Worker 的 Trigger 请求返回 503。 |
