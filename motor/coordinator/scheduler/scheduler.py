@@ -10,6 +10,8 @@
 
 import asyncio
 import uuid
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from motor.common.logger import get_logger
 from motor.common.resources.instance import Instance, PDRole
@@ -17,6 +19,10 @@ from motor.config.coordinator import CoordinatorConfig, SchedulerType
 from motor.coordinator.domain import InstanceProvider, InstanceReadiness, readiness_from_instances
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.factory import SchedulingPolicyFactory
+
+if TYPE_CHECKING:
+    from motor.coordinator.scheduler.policy.tars.original.models import TarsOriginalConfig
+    from motor.coordinator.scheduler.policy.tars.state_runtime import TarsStateRuntime
 
 logger = get_logger(__name__)
 
@@ -57,6 +63,7 @@ class Scheduler:
             self._config = config
 
         self._instance_provider = instance_provider
+        self._tars_state_runtime = None
         self._prefill_policy = SchedulingPolicyFactory.create(self._prefill_policy_type, self._instance_provider)
         if self._decode_policy_type == self._prefill_policy_type:
             self._decode_policy = self._prefill_policy
@@ -95,6 +102,36 @@ class Scheduler:
     def get_scheduling_policy(self, role: PDRole | None = None) -> BaseSchedulingPolicy:
         """Return the scheduling policy for the given role (prefill policy when role is omitted)."""
         return self._policy_for_role(role)
+
+    def get_tars_state_runtime(self) -> "TarsStateRuntime | None":
+        """Return the explicitly created dormant TARS state owner, if any."""
+        return self._tars_state_runtime
+
+
+    def create_tars_state_runtime(
+        self,
+        scheduler_id: str,
+        config: "TarsOriginalConfig | None" = None,
+        clock: "Callable[[], float] | None" = None,
+    ) -> "TarsStateRuntime":
+        """Lazily create the sole TARS state aggregate owned by this Scheduler."""
+        if self._tars_state_runtime is not None:
+            if self._tars_state_runtime.scheduler_id != scheduler_id:
+                raise RuntimeError(
+                    "Scheduler already owns a TARS runtime for "
+                    f"{self._tars_state_runtime.scheduler_id}"
+                )
+            return self._tars_state_runtime
+
+        from motor.coordinator.scheduler.policy.tars.state_runtime import TarsStateRuntime
+
+        self._tars_state_runtime = TarsStateRuntime(
+            scheduler_id=scheduler_id,
+            config=config,
+            clock=clock,
+        )
+        return self._tars_state_runtime
+
 
     async def get_available_instances(self, role: PDRole | None = None) -> dict[int, Instance]:
         """

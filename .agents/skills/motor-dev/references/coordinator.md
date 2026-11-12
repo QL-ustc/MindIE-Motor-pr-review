@@ -222,6 +222,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
+| `TarsPolicy` (dormant) | Stable dual-hash plus cache-credit/TTFT selection over pure data models | Not selectable until the later public-activation gate |
 | `DynamicBucketPolicy` | Splits endpoints into deterministic short/long buckets, then combines request length affinity with each bucket's active-token load | Mixed short/long decode workloads |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
@@ -249,6 +250,142 @@ and per-DP registrations, rejects mixed runtime models, queries only `/workers`
 (never legacy `/services`), and treats a valid empty `/workers` response as a
 control-plane restart requiring cold pool/per-DP re-registration. Worker
 presence is not cache readiness and does not imply warm-hit preservation.
+
+**Dormant TARS data and state path** (`scheduler/policy/tars/`) is intentionally
+not registered in `SchedulerType` or `SchedulingPolicyFactory`. Its
+original-core sub-package contains immutable models, TTFT scoring, and
+selection; the upstream-derived algorithm license is retained in
+`original/LICENSE`. Import and normal `Scheduler` construction do not query
+Conductor, start threads, mutate workload, or create TARS queue state.
+
+`TarsStateRuntime` is an explicit, in-process state aggregate for the later
+runtime-activation layer. `Scheduler.create_tars_state_runtime()` lazily creates
+at most one aggregate per Scheduler; no existing scheduling call invokes it.
+The aggregate is the sole owner of queued attempts, per-target queue indexes,
+reservations, workloads, replica pending/running indexes, and capacity
+accounting. Each attempt is identified by `(request_id, attempt_seq)` and can
+occupy exactly one phase (`queued`, `reserved`, or `running`).
+
+Topology installation accepts only a strictly newer non-negative epoch. A
+removed target becomes an inactive tombstone while an attempt still references
+it, so a stale update cannot silently rewrite a selected, owned, or final
+target. Rebalancing is allowed only for a queued, unlocked attempt planned
+against the current epoch; a visited-target list prevents routing cycles.
+Final-target locking first verifies that the selected replica has enough token
+and block capacity; a failed check leaves the target unlocked and eligible for
+rebalance. A successful reservation atomically locks the final target, assigns
+the sole owner, charges pending compute tokens and request blocks, and removes
+the queue entry. Before workload commit, a locked final target can be
+explicitly released back to the same queued attempt; after workload commit,
+completion/abort is the only cleanup path. Completion/abort removes every
+transient index; `quiesce()` retains only the current active replica inventory.
+
+Pending capacity is measured in estimated compute tokens. Block capacity is
+charged across both reserved-prefill and running phases. Remaining pending TTFT
+is derived from the injected monotonic clock, making timeout/budget tests
+deterministic.
+
+`handoff_protocol.py` adds a dormant, transport-neutral Scheduler/Router
+protocol above this aggregate. A Handoff attempt reserves Prefill first, writes
+a pending-delivery record, requires the Router to persist the exact
+`(request_id, attempt_seq, scheduler_epoch, target, delivery_token)` before
+confirmation, and permits dispatch only after confirmation transfers
+ownership. Decode allocation remains deferred until Prefill settlement has
+idempotently released the Prefill workload. Immediately before Decode commit,
+the protocol rechecks topology epoch, circuit state, role, and P/D engine type.
+
+Every ownership boundary returns a typed failure. Pre-confirm failures revoke
+the Scheduler allocation; post-confirm failures abort the attempt and release
+both Prefill and Decode ledgers. Terminal lifecycle events and revocation are
+idempotent, while a reused attempt identity with different input is rejected.
+The timeout contract is strict:
+`client_timeout > server_timeout > queue_wait + final_query + exact_commit +
+settlement_margin`. Scheduler stages and the client boundary use an injected
+monotonic clock. Pending delivery has an explicit lease; expiry compensates the
+Scheduler state and `STATUS` reports `DELIVERY_LEASE_EXPIRED` so the Router can
+remove its durable entry. Caller cancellation is compensated at the current
+ownership boundary and the original cancellation is re-raised.
+
+The protocol lifecycle is `RUNNING → DRAINING → STOPPED`. Draining rejects new
+attempts, allows existing attempts to finish, and aborts remaining work at its
+deadline. A graceful restart may enter `RUNNING` only from an empty transient
+runtime. An ungraceful restart changes Scheduler epoch, cold-clears local
+transient state, and remains `RECOVERING`/not-ready after cooldown; it requires
+an empty reconciled Router ledger and explicit operator confirmation before
+returning to `RUNNING`. This is epoch isolation, not transaction recovery: no
+pending delivery, reservation, workload, or warm cache claim is replayed.
+
+`quiesce()` removes protocol and Router transient ledgers but retains target and
+replica inventory. This layer is not registered in `SchedulerType`, does not
+add ZMQ message types, has no endpoint allocation or public configuration, and
+does not alter `ALLOCATE_ONLY`, Trigger, Handoff, Bootstrap, or PDHybrid runtime
+paths. Transport wiring and public activation remain later gates.
+
+`single_role_adapters.py` reuses that confirmed-delivery protocol without
+flattening the Router's mode-specific timing. Trigger reserves a fresh identity
+before master's existing D-first allocation but creates no TARS admission at
+that point. Its serialized metaserver callback admits P only after D is bound,
+requires matching engine and topology epochs, persists and confirms the P
+target before dispatch, then settles P and records the already selected D.
+Duplicate callbacks reuse the completed result; late callbacks and cancellation
+cannot leave protocol, Router, reservation, or workload state behind.
+
+PDHybrid admits only an explicit `UNIFIED` target and assigns a fresh attempt
+identity to every retry. A combined engine has no physical Prefill completion
+boundary, so the adapter rejects `prefill_complete`, retains capacity until
+`request_complete` or `abort`, and rejects stale identities and Scheduler
+epochs. Both adapters remain dormant: production Router modules do not import
+them, and they add no public configuration or transport endpoint.
+
+`bootstrap_joint_protocol.py` models the separate Bootstrap-only P/D ownership
+boundary. Its identity-free preflight rejects non-Bootstrap mode, stale epochs,
+incompatible target roles/engines, open circuits, and insufficient Decode
+capacity before consuming an attempt sequence. After preflight, Prefill is
+selected and charged through `TarsStateRuntime`; Decode selection is delegated
+to an injected, side-effect-free callback so a later activation layer can keep
+the native master selection mechanism. The server revalidates both targets
+before either workload commit, persists the P and D ledgers, and returns one
+pending pair with one delivery token. Router dispatch visibility is allowed
+only after that pair is persisted and confirmed; it is never represented as
+two independent single-role allocations.
+
+Pre-confirm failures revoke the joint allocation and compensate Decode before
+Prefill. After ownership transfer, `prefill_complete` idempotently releases
+only Prefill, while `request_complete` releases Decode; any post-confirm fault
+aborts the remaining pair. Duplicate joint admission is rejected rather than
+joined or taken over. This protocol remains dormant and transport-neutral: it
+is not imported by production Router code, registered in `SchedulerType`,
+exposed through ZMQ, or configured publicly.
+
+TARS logical target identity is exactly `(str(instance.id), dp_rank)`; endpoint
+IP, port, pod name, endpoint object, and candidate-list position are transport
+metadata, not identity. Session affinity prefers
+`RequestInfo.agent_hint_info.session_id` and falls back explicitly to
+`RequestInfo.req_id`. Token accounting uses `len(RequestInfo.token_ids)` and
+fails if token IDs are unavailable; `req_len` is request-body length and must
+never be used as a token count. Dual-hash choice uses stable BLAKE2 rendezvous
+scores over the shortest session prefix and logical target, with no Python
+process hash or global RNG state.
+
+The pure Conductor adapter accepts only the all-or-nothing K3
+`ConductorEvidence` snapshot. For each expected target:
+
+``` text
+observed_exact_dp_npu_tokens =
+    min(input_tokens, npu_blocks * block_size) when exact_dp_npu_provenance is true
+    0 otherwise
+best_effort_cache_credit_tokens = observed_exact_dp_npu_tokens
+estimated_compute_tokens = input_tokens - best_effort_cache_credit_tokens
+```
+
+Only capability `dp_npu_only` can carry cache credit. CPU/Disk block counts and
+matched-token counts remain diagnostics and are never summed into scheduling
+credit. An available but non-provenance tuple is compute-only; a missing or
+extra tuple invalidates the complete batch. Terms `local` and `remote` are not
+used because neither DP nor physical-node placement follows from media tier.
+Unavailable evidence preserves the K3 pre-admission zero-mutation LB fallback
+versus post-admission STATUS/revocation boundary, but this dormant stage does
+not implement admission state or dispatch.
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
@@ -425,6 +562,7 @@ Hot-reload is driven by a process-local `ConfigWatcher` in the **Inference Worke
 | `motor/coordinator/process/constants.py` | | Process keys, start/stop order |
 | `motor/coordinator/scheduler/scheduler.py` | | `Scheduler`: Mgmt precision sampling/alarm state (not SchedulingFacade) |
 | `motor/coordinator/scheduler/policy/factory.py` | | `SchedulingPolicyFactory` registry |
+| `motor/coordinator/scheduler/policy/tars/` | | Dormant TARS models/scorer/selector, evidence and mode adapters, state aggregate, and lease/epoch-isolated delivery protocol |
 | `motor/coordinator/scheduler/runtime/scheduler_server.py` | | `AsyncSchedulerServer`: Mgmt control plane (ROUTER+PUB, CB, precision, SHM owner) |
 | `motor/coordinator/scheduler/runtime/scheduler_client.py` | | `AsyncSchedulerClient`: control-plane DEALER + instance cache + SHM CAS |
 | `motor/coordinator/scheduler/runtime/dp_stats.py` | | Per-worker timer: per-DP request counts + shared SHM `active_tokens`; preserve nonzero windows, skip unchanged idle snapshots, flush on disconnect |
