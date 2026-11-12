@@ -1,0 +1,29 @@
+{
+  "default": {
+    "prefill-0": {
+      "longest_matched": 512,
+      "DP": {
+        "0": {
+          "matched_tokens": 384,
+          "npu_blocks": 3,
+          "cpu_blocks": 0,
+          "disk_blocks": 0,
+          "npu_end": 3,
+          "cpu_end": 3,
+          "disk_end": 0,
+          "exact_dp_npu_provenance": true
+        },
+        "1": {
+          "matched_tokens": 512,
+          "npu_blocks": 1,
+          "cpu_blocks": 3,
+          "disk_blocks": 0,
+          "npu_end": 1,
+          "cpu_end": 4,
+          "disk_end": 0,
+          "exact_dp_npu_provenance": false
+        }
+      }
+    }
+  }
+}

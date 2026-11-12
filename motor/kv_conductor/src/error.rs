@@ -14,6 +14,16 @@ pub enum KvConductorError {
     #[error("instance {instance_id} not found")]
     InstanceNotFound { instance_id: String },
 
+    #[error(
+        "registration identity conflict for instance={instance_id} dp_rank={dp_rank}: {reason}; \
+         unregister the existing instance before reusing its identity"
+    )]
+    RegistrationIdentityConflict {
+        instance_id: String,
+        dp_rank: u32,
+        reason: String,
+    },
+
     #[error("no indexer found for model={model_name} tenant={tenant_id}")]
     NoIndexer {
         model_name: String,

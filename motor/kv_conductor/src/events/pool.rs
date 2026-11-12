@@ -31,6 +31,15 @@ use crate::protocols::*;
 use super::flex_hash::FlexHash;
 use super::helpers::{resolve_medium, resolve_workers};
 
+/// Result of applying one pool event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PoolEventOutcome {
+    /// The event was applied, intentionally dropped, or had no target worker.
+    Applied,
+    /// The event carried only NPU evidence that cannot be trusted under IP fanout.
+    SkippedExactDp,
+}
+
 /// Minimum interval between repeated unresolved-target WARN lines for the
 /// same `(event_backend_id, subscriber_backend_id)` key.
 const UNRESOLVED_POOL_WARN_INTERVAL: Duration = Duration::from_secs(30);
@@ -160,7 +169,7 @@ pub(crate) fn apply_pool_event(
     default_media: &[StorageMedium],
     match_mode: MatchMode,
     hbm_ip_index: &Option<HbmIpIndex>,
-) -> Result<(), KvConductorError> {
+) -> Result<PoolEventOutcome, KvConductorError> {
     let event_type = pool_event
         .event_type
         .as_deref()
@@ -194,7 +203,21 @@ pub(crate) fn apply_pool_event(
     }
 
     // ── Resolve target workers (shared by all event types) ────────────
-    let target_media = resolve_medium(pool_event.medium.as_deref(), default_media);
+    let mut target_media = resolve_medium(pool_event.medium.as_deref(), default_media);
+    if match_mode == MatchMode::IpOnly {
+        target_media.retain(|medium| *medium != StorageMedium::Npu);
+        if target_media.is_empty() {
+            tracing::debug!(
+                event_id = pool_event.event_id,
+                event_type,
+                backend_id = pool_event.backend_id.as_deref().unwrap_or(backend_id),
+                dp_rank = pool_event.dp_rank.unwrap_or(subscriber_dp_rank),
+                reason = "ip_only_npu_only",
+                "kv_event skipped exact-dp tier"
+            );
+            return Ok(PoolEventOutcome::SkippedExactDp);
+        }
+    }
 
     // For MatchMode::None (YuanRong NPU), use the subscriber's backend_id which
     // IS the engine instance_id from registration.  The event's backend_id may
@@ -228,7 +251,7 @@ pub(crate) fn apply_pool_event(
     // is a permanently zero CPU/Disk hit rate.
     if target_workers.is_empty() {
         warn_unresolved_pool_event(be_id, backend_id, event_type);
-        return Ok(());
+        return Ok(PoolEventOutcome::Applied);
     }
 
     // ── Cleared events: no seq_hashes needed ──────────────────────────
@@ -237,7 +260,7 @@ pub(crate) fn apply_pool_event(
             entry.apply_event(worker, &KvCacheEventData::Cleared)?;
             entry.remove_pending_worker(worker);
         }
-        return Ok(());
+        return Ok(PoolEventOutcome::Applied);
     }
 
     if seq_hashes.is_empty() {
@@ -248,7 +271,7 @@ pub(crate) fn apply_pool_event(
             reason = "no_hashes",
             "kv_event dropped"
         );
-        return Ok(());
+        return Ok(PoolEventOutcome::Applied);
     }
 
     // ── Stored / Removed ──────────────────────────────────────────────
@@ -333,5 +356,5 @@ pub(crate) fn apply_pool_event(
         }
     }
 
-    Ok(())
+    Ok(PoolEventOutcome::Applied)
 }

@@ -21,6 +21,30 @@ use kv_conductor::server::{create_router, AppState};
 
 mod common;
 
+/// Assert an exact HTTP status code without repeating the raw chain in tests.
+macro_rules! assert_status {
+    ($response:expr, $expected:expr) => {
+        assert_eq!(
+            $response.status().as_u16(),
+            $expected,
+            "unexpected HTTP status"
+        );
+    };
+    ($response:expr, $expected:expr, $message:expr) => {
+        assert_eq!($response.status().as_u16(), $expected, $message);
+    };
+}
+
+/// Decode a JSON response body, failing fast on malformed payloads.
+async fn read_json(response: reqwest::Response) -> Value {
+    response.json().await.expect("invalid JSON body")
+}
+
+/// Decode a text response body, failing fast on malformed payloads.
+async fn read_text(response: reqwest::Response) -> String {
+    response.text().await.expect("invalid text body")
+}
+
 /// Start a test server on a random port, returning the base URL.
 async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
     let registry = Arc::new(WorkerRegistry::new());
@@ -50,10 +74,10 @@ async fn test_health_endpoint() {
         .get(format!("{}/health", base_url))
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "OK");
+    assert_status!(resp, 200);
+    assert_eq!(read_text(resp).await, "OK");
 }
 
 #[tokio::test]
@@ -81,9 +105,9 @@ async fn test_register_and_query() {
         .json(&register_data)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
-    assert_eq!(resp.status(), 201);
+    assert_status!(resp, 201);
 
     // Query with token IDs. The response will be empty since no KV events
     // have been applied to the tree yet.
@@ -99,10 +123,10 @@ async fn test_register_and_query() {
         .json(&query_data)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
+    assert_status!(resp, 200);
+    let body: Value = read_json(resp).await;
     // Should have the tenant key with an empty object (no cached blocks yet)
     assert!(body.get("default").is_some());
 }
@@ -132,8 +156,8 @@ async fn test_query_after_kv_events() {
             }))
             .send()
             .await
-            .unwrap();
-        assert_eq!(resp.status(), 201);
+            .expect("request failed");
+        assert_status!(resp, 201);
     }
 
     // Apply KV events to populate the indexer tree for worker 0
@@ -141,6 +165,8 @@ async fn test_query_after_kv_events() {
     // For block_size=4, tokens [1,2,3,4] -> block hash A, [5,6,7,8] -> block hash B
     // We simulate storing a chain: root -> block_A -> block_B
     let events = json!({
+        "instance_id": "vllm-prefill-0",
+        "model_name": "test-model",
         "events": [
             {
                 "event_id": 1,
@@ -157,12 +183,13 @@ async fn test_query_after_kv_events() {
         "shutdown": false
     });
 
-    let _resp = client
+    let resp = client
         .post(format!("{}/events", base_url))
         .json(&events)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
+    assert_status!(resp, 200);
 
     // Query: should return results now
     let query_data = json!({
@@ -177,16 +204,40 @@ async fn test_query_after_kv_events() {
         .json(&query_data)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
+    assert_status!(resp, 200);
+    let body: Value = read_json(resp).await;
     println!(
         "Query response: {}",
         serde_json::to_string_pretty(&body).unwrap()
     );
     // Response should have structure: { "default": { "vllm-prefill-0": { "longest_matched": ..., "DP": {...} } } }
     assert!(body.get("default").is_some());
+}
+
+#[tokio::test]
+async fn test_events_reject_unregistered_instance() {
+    let (base_url, _handle) = start_test_server().await;
+    let client = Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/events"))
+        .json(&json!({
+            "instance_id": "missing-prefill",
+            "model_name": "test-model",
+            "events": [{
+                "event_id": 1,
+                "type": "stored",
+                "blocks": [{"block_hash": 100, "tokens_hash": 123}],
+                "dp_rank": 0
+            }]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_status!(resp, 404);
 }
 
 #[tokio::test]
@@ -212,16 +263,16 @@ async fn test_unregister() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     // Verify worker is listed
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     let workers = body["workers"].as_array().unwrap();
     assert_eq!(workers.len(), 1);
 
@@ -238,16 +289,16 @@ async fn test_unregister() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+        .expect("request failed");
+    assert_status!(resp, 200);
 
     // Verify worker is gone
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     let workers = body["workers"].as_array().unwrap();
     assert_eq!(workers.len(), 0);
 }
@@ -276,8 +327,8 @@ async fn test_same_backend_reregistration_is_accepted() {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     // Re-registration with same backend is accepted (201).
     let resp = client
@@ -285,8 +336,8 @@ async fn test_same_backend_reregistration_is_accepted() {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 }
 
 #[tokio::test]
@@ -306,8 +357,8 @@ async fn test_unregister_nonexistent() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
+        .expect("request failed");
+    assert_status!(resp, 404);
 }
 
 #[tokio::test]
@@ -319,9 +370,9 @@ async fn test_workers_endpoint_empty() {
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    assert_status!(resp, 200);
+    let body: Value = read_json(resp).await;
     assert!(body["workers"].as_array().unwrap().is_empty());
 }
 
@@ -346,8 +397,8 @@ async fn test_mooncake_hbm_plus_pool_registration() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "HBM registration should succeed");
+        .expect("request failed");
+    assert_status!(resp, 201, "HBM registration should succeed");
 
     // Register pool (legacy endpoint, store_backend=Mooncake)
     let resp = client
@@ -363,16 +414,16 @@ async fn test_mooncake_hbm_plus_pool_registration() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "Pool registration should succeed");
+        .expect("request failed");
+    assert_status!(resp, 201, "Pool registration should succeed");
 
     // Verify both are listed
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     let workers = body["workers"].as_array().unwrap();
     assert_eq!(workers.len(), 2);
     let ids: Vec<&str> = workers
@@ -381,6 +432,20 @@ async fn test_mooncake_hbm_plus_pool_registration() {
         .collect();
     assert!(ids.contains(&"mooncake-prefill-0"));
     assert!(ids.contains(&"mooncake-pool"));
+    let direct = workers
+        .iter()
+        .find(|worker| worker["instance_id"] == "mooncake-prefill-0")
+        .unwrap();
+    let pool = workers
+        .iter()
+        .find(|worker| worker["instance_id"] == "mooncake-pool")
+        .unwrap();
+    assert!(direct["endpoints"]["0"]["exact_dp_npu_provenance"]
+        .as_bool()
+        .unwrap());
+    assert!(!pool["endpoints"]["0"]["exact_dp_npu_provenance"]
+        .as_bool()
+        .unwrap());
 }
 
 // ── Memcache backend: HBM + pool registration ─────────────────────
@@ -404,8 +469,8 @@ async fn test_memcache_hbm_plus_pool_registration() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     // Pool
     let resp = client
@@ -421,15 +486,15 @@ async fn test_memcache_hbm_plus_pool_registration() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     assert_eq!(body["workers"].as_array().unwrap().len(), 2);
 }
 
@@ -458,16 +523,16 @@ async fn test_yuanrong_multi_port_registration() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     // Verify medium_endpoints stored correctly
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     let w = &body["workers"].as_array().unwrap()[0];
     let meps = &w["endpoints"]["0"]["medium_endpoints"];
     assert_eq!(meps["npu"], "tcp://10.0.2.1:15557");
@@ -571,17 +636,17 @@ async fn test_mooncake_duplicate_hbm_registration() {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     let resp = client
         .post(format!("{}/register", base_url))
         .json(&reg)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
     // Re-registration with same backend is accepted (201).
-    assert_eq!(resp.status(), 201);
+    assert_status!(resp, 201);
 }
 
 // ── Mooncake pool: duplicate pool registration ─────────────────────
@@ -606,17 +671,17 @@ async fn test_mooncake_duplicate_pool_registration() {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     let resp = client
         .post(format!("{}/register", base_url))
         .json(&reg)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
     // Re-registration with same backend is accepted (201).
-    assert_eq!(resp.status(), 201);
+    assert_status!(resp, 201);
 }
 
 // ── Unregister cleans up state ──────────────────────────────────────
@@ -640,15 +705,15 @@ async fn test_unregister_mooncake_hbm_removes_worker() {
         }))
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
     // Verify present
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     assert_eq!(body["workers"].as_array().unwrap().len(), 1);
 
     // Unregister
@@ -663,16 +728,16 @@ async fn test_unregister_mooncake_hbm_removes_worker() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+        .expect("request failed");
+    assert_status!(resp, 200);
 
     // Verify gone
     let resp = client
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     assert_eq!(body["workers"].as_array().unwrap().len(), 0);
 }
 
@@ -701,9 +766,9 @@ async fn test_unknown_backend_falls_back_to_yuanrong() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
+        .expect("request failed");
+    assert_status!(
+        resp,
         201,
         "Unknown backend should fall back to multi-port behavior"
     );
@@ -728,11 +793,11 @@ async fn test_registration_without_endpoint_allows_http_only() {
         }))
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
     // HTTP-only registration (no ZMQ endpoints) is now allowed — the
     // conductor creates an indexer entry without spawning ZMQ subscribers.
-    assert_eq!(
-        resp.status(),
+    assert_status!(
+        resp,
         201,
         "HTTP-only registration (no endpoint) should succeed"
     );
@@ -742,15 +807,69 @@ async fn test_registration_without_endpoint_allows_http_only() {
         .get(format!("{}/workers", base_url))
         .send()
         .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    let body: Value = read_json(resp).await;
     assert_eq!(body["workers"].as_array().unwrap().len(), 1);
 }
 
-// ── Re-registration: same backend preserves tree data ────────────────
+#[tokio::test]
+async fn test_registration_identity_conflict_returns_409_without_mutation() {
+    let (base_url, _handle) = start_test_server().await;
+    let client = Client::new();
+    let registration = json!({
+        "instance_id": "identity-conflict",
+        "type": "vLLM",
+        "store_backend": "Mooncake",
+        "modelname": "model-a",
+        "block_size": 128,
+        "dp_rank": 0,
+        "tenant_id": "default"
+    });
+    let response = client
+        .post(format!("{}/register", base_url))
+        .json(&registration)
+        .send()
+        .await
+        .expect("request failed");
+    assert_status!(response, 201);
+
+    let mut conflict = registration.clone();
+    conflict["modelname"] = json!("model-b");
+    let response = client
+        .post(format!("{}/register", base_url))
+        .json(&conflict)
+        .send()
+        .await
+        .expect("request failed");
+    assert_status!(response, 409);
+    let body: Value = read_json(response).await;
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("registration identity conflict")));
+
+    let workers: Value = client
+        .get(format!("{}/workers", base_url))
+        .send()
+        .await
+        .expect("request failed")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(workers["workers"].as_array().unwrap().len(), 1);
+    assert_eq!(workers["workers"][0]["model_name"], "model-a");
+    assert_eq!(
+        workers["workers"][0]["endpoints"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+// ── Re-registration: same backend clears stale HBM data ──────────────
 
 #[tokio::test]
-async fn test_reregister_same_backend_preserves_tree() {
+async fn test_reregister_same_backend_clears_hbm() {
     let (base_url, _handle) = start_test_server().await;
     let client = Client::new();
 
@@ -775,28 +894,48 @@ async fn test_reregister_same_backend_preserves_tree() {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "first registration should succeed");
+        .expect("request failed");
+    assert_status!(resp, 201, "first registration should succeed");
 
     // Inject a KV event to populate the radix tree
     let events = json!({
+        "instance_id": "rereg-same",
         "events": [{
             "event_id": 1,
-            "data": {
-                "type": "stored",
-                "parent_hash": null,
-                "blocks": [{"block_hash": 900, "tokens_hash": 900}]
-            },
+            "type": "stored",
+            "parent_hash": null,
+            "blocks": [{"block_hash": 900, "tokens_hash": 900}],
             "dp_rank": 0
         }],
         "shutdown": false
     });
-    client
+    let resp = client
         .post(format!("{}/events", base_url))
         .json(&events)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
+    assert_status!(resp, 200);
+
+    let query_data = json!({
+        "model": "rereg-model",
+        "block_size": 4,
+        "block_hashes": [900],
+        "tenant_id": "default"
+    });
+    let before: Value = client
+        .post(format!("{}/query_by_hash", base_url))
+        .json(&query_data)
+        .send()
+        .await
+        .expect("request failed")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        before["default"]["rereg-same"]["DP"]["0"]["npu_blocks"], 1,
+        "unexpected pre-registration query response: {before}"
+    );
 
     // Re-register with same backend (different endpoint)
     let mut reg2 = reg.clone();
@@ -810,32 +949,29 @@ async fn test_reregister_same_backend_preserves_tree() {
         .json(&reg2)
         .send()
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
+        .expect("request failed");
+    assert_status!(
+        resp,
         201,
         "re-registration with same backend should succeed"
     );
 
-    // Query: tree data should still exist (token hash 900 matches).
-    let query_data = json!({
-        "model": "rereg-model",
-        "block_size": 4,
-        "token_ids": [1, 2, 3, 4],
-        "tenant_id": "default"
-    });
+    // Query: the old process's HBM state must be gone even though the backend
+    // type is unchanged.
     let resp = client
-        .post(format!("{}/query", base_url))
+        .post(format!("{}/query_by_hash", base_url))
         .json(&query_data)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    // With tokens_hash=900 at block_size=4, should match if tree preserved.
+        .expect("request failed");
+    assert_status!(resp, 200);
+    let body: Value = read_json(resp).await;
+    let has_data = body["default"]
+        .as_object()
+        .is_some_and(|instances| !instances.is_empty());
     assert!(
-        body.get("default").is_some(),
-        "tree should be preserved on same-backend re-registration"
+        !has_data,
+        "same-backend re-registration must clear stale HBM data"
     );
 }
 
@@ -867,28 +1003,48 @@ async fn test_reregister_different_backend_drops_tree() {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     // Inject a KV event
     let events = json!({
+        "instance_id": "rereg-diff",
         "events": [{
             "event_id": 1,
-            "data": {
-                "type": "stored",
-                "parent_hash": null,
-                "blocks": [{"block_hash": 800, "tokens_hash": 800}]
-            },
+            "type": "stored",
+            "parent_hash": null,
+            "blocks": [{"block_hash": 800, "tokens_hash": 800}],
             "dp_rank": 0
         }],
         "shutdown": false
     });
-    client
+    let resp = client
         .post(format!("{}/events", base_url))
         .json(&events)
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
+    assert_status!(resp, 200);
+
+    let query_data = json!({
+        "model": "rereg-diff-model",
+        "block_size": 4,
+        "block_hashes": [800],
+        "tenant_id": "default"
+    });
+    let before: Value = client
+        .post(format!("{}/query_by_hash", base_url))
+        .json(&query_data)
+        .send()
+        .await
+        .expect("request failed")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        before["default"]["rereg-diff"]["DP"]["0"]["npu_blocks"], 1,
+        "unexpected pre-registration query response: {before}"
+    );
 
     // Re-register with DIFFERENT backend
     let mut reg2 = reg.clone();
@@ -898,28 +1054,22 @@ async fn test_reregister_different_backend_drops_tree() {
         .json(&reg2)
         .send()
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
+        .expect("request failed");
+    assert_status!(
+        resp,
         201,
         "re-registration with different backend should succeed"
     );
 
     // Query: tree data should be gone (backend changed → data dropped).
-    let query_data = json!({
-        "model": "rereg-diff-model",
-        "block_size": 4,
-        "token_ids": [1, 2, 3, 4],
-        "tenant_id": "default"
-    });
     let resp = client
-        .post(format!("{}/query", base_url))
+        .post(format!("{}/query_by_hash", base_url))
         .json(&query_data)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    assert_status!(resp, 200);
+    let body: Value = read_json(resp).await;
     // Default tenant may not appear at all if no workers have data.
     let default = body.get("default");
     let has_data = default
@@ -955,8 +1105,8 @@ async fn register_and_seed(client: &Client, base_url: &str) {
         .json(&reg)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        .expect("request failed");
+    assert_status!(resp, 201);
 
     let events = json!({
         "instance_id": "vllm-prefill-42",
@@ -980,8 +1130,8 @@ async fn register_and_seed(client: &Client, base_url: &str) {
         .json(&events)
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+        .expect("request failed");
+    assert_status!(resp, 200);
 }
 
 #[tokio::test]
@@ -1002,9 +1152,9 @@ async fn test_query_msgpack_endpoint() {
         .body(rmp_serde::to_vec(&req).unwrap())
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
-    assert_eq!(resp.status(), 200);
+    assert_status!(resp, 200);
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1031,9 +1181,9 @@ async fn test_query_msgpack_endpoint() {
         }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(json_resp.status(), 200);
-    let json_body: Value = json_resp.json().await.unwrap();
+        .expect("request failed");
+    assert_status!(json_resp, 200);
+    let json_body: Value = read_json(json_resp).await;
 
     assert_eq!(
         msgpack_json, json_body,
@@ -1065,9 +1215,9 @@ async fn test_query_by_hash_msgpack_endpoint() {
         .body(rmp_serde::to_vec(&req).unwrap())
         .send()
         .await
-        .unwrap();
+        .expect("request failed");
 
-    assert_eq!(resp.status(), 200);
+    assert_status!(resp, 200);
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1103,8 +1253,8 @@ async fn test_query_msgpack_error_paths() {
         .body(rmp_serde::to_vec(&req).unwrap())
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
+        .expect("request failed");
+    assert_status!(resp, 404);
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1126,8 +1276,8 @@ async fn test_query_msgpack_error_paths() {
         .body(vec![0xc1u8, 0xff, 0x00]) // invalid msgpack bytes
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+        .expect("request failed");
+    assert_status!(resp, 400);
     let bytes = resp.bytes().await.unwrap();
     let err = common::rmpv_to_json(&rmpv::decode::read_value(&mut bytes.as_ref()).unwrap());
     assert!(
@@ -1142,8 +1292,8 @@ async fn test_query_msgpack_error_paths() {
         .body(vec![0xc1u8, 0xff, 0x00])
         .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-    let body: Value = resp.json().await.unwrap();
+        .expect("request failed");
+    assert_status!(resp, 400);
+    let body: Value = read_json(resp).await;
     assert!(body.get("error").is_some());
 }

@@ -229,16 +229,20 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 
 - 首次注册会创建 `(model_name, tenant_id)` 对应的 `IndexerEntry`，并按去重后的 endpoint
   创建 ZMQ subscriber；HTTP-only 注册允许 endpoint 为空。
-- 同一 `(instance_id, dp_rank)` 重注册时，旧 subscriber 会先停止。后端未变化时保留已有
-  索引，仅更新 endpoint；后端变化时清除该实例/DP 的 NPU/CPU/Disk 索引和旧 HBM IP 映射。
-- `replay_endpoint` 只在该 `instance_id` 首次出现时通过 `spawn_blocking` 执行历史事件回放，
-  不是按 `(instance_id, dp_rank)` 首次出现判定。因此同一实例后续注册的 DP 不会各自触发回放。
+- 同一 `(instance_id, dp_rank)` 重注册时，旧 subscriber 会先停止。后端未变化时清除该 DP
+  的 NPU 索引、保留 CPU/Disk；后端变化时清除该 DP 的 NPU/CPU/Disk 索引和旧 HBM IP 映射。
+- `replay_endpoint` 只在 `(instance_id, dp_rank)` 首次注册时通过 `spawn_blocking` 执行历史
+  事件回放。重注册会跳过 replay，NPU 索引只能由后续新事件重建，避免把无法证明完整性的
+  旧状态标成 exact-DP 证据。进入 replay 前会释放全局 `instances` 写锁，只保留 per-instance
+  lifecycle lock，避免阻塞 `/query`、`/workers` 或其他实例的注册/注销。
 - 回放和实时订阅共用注册时解析的路由身份、MatchMode 和 HBM IP 索引。YuanRong 节点池从
   CPU/Disk endpoint 提取节点 IP，缺少 `backend_id` 的 pool 回放事件也能关联节点内 DP。
   Pool 回放走 pool 格式分流，避免无 `type` 的事件被 vLLM 解析器吞掉。
 - 回放与查询并行，没有索引恢复就绪门禁；只能回放发布端仍保留的历史事件。
 - 注销会停止该实例/DP 的全部 subscriber，删除 HBM IP 映射及三层索引；删除最后一个 DP
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
+- `POST /events` 只接受已注册的 `(instance_id, dp_rank)`；未注册 tuple 返回 HTTP 404 且
+  不创建索引状态，避免客户端在注册前伪造 exact-DP NPU provenance。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
 
 Coordinator 的 `re_register_interval_sec` 默认 0，周期对账关闭。开启后调用 `GET /workers`：

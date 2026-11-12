@@ -22,6 +22,7 @@ from motor.coordinator.api_client.conductor_api_client import (
     ConductorApiClient,
     conductor_instance_id,
 )
+from motor.coordinator.api_client.conductor_evidence import ConductorSchemaError
 
 # ------------------------------------------------------------------
 # Helpers
@@ -92,6 +93,29 @@ def _mock_config(**overrides) -> Mock:
     legacy.http_server_port = overrides.get("http_server_port", 13333)
     cfg.prefill_kv_event_config = legacy
     return cfg
+
+
+def _registered_worker(
+    instance_id: str = "vllm-prefill-1",
+    model_name: str = "qwen",
+    ranks: tuple[int, ...] = (0,),
+) -> dict:
+    return {
+        "instance_id": instance_id,
+        "model_name": model_name,
+        "tenant_id": "default",
+        "block_size": 128,
+        "endpoints": {
+            str(rank): {
+                "medium_endpoints": {"npu": f"tcp://10.0.0.1:{5557 + rank}"},
+                "engine_type": "vLLM",
+                "dp_rank": rank,
+                "replay_endpoint": None,
+                "exact_dp_npu_provenance": True,
+            }
+            for rank in ranks
+        },
+    }
 
 
 # ------------------------------------------------------------------
@@ -300,7 +324,7 @@ class TestBuildRegisterPayload:
 
 
 class TestNormalizeServiceKey:
-    """Cover field extraction from both kv-conductor and Mooncake Master formats."""
+    """Cover tuple extraction without accepting the legacy uppercase schema."""
 
     # ── kv-conductor format (WorkerSummary) ──────────────────────────
 
@@ -351,7 +375,7 @@ class TestNormalizeServiceKey:
     # ── Mooncake Master format (flat fields) ─────────────────────────
 
     def test_mooncake_master_basic(self):
-        """Mooncake Master: InstanceID + DPRank."""
+        """Mooncake Master uppercase fields are not normalized."""
         service = {
             "InstanceID": "vllm-prefill-1",
             "DPRank": 0,
@@ -359,25 +383,25 @@ class TestNormalizeServiceKey:
             "ReplayEndpoint": "tcp://10.0.0.1:6667",
         }
         keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", 0)}
+        assert keys == set()
 
     def test_mooncake_master_dp_rank_zero(self):
         """dp_rank=0 must NOT be treated as falsy."""
         service = {"InstanceID": "vllm-prefill-1", "DPRank": 0}
         keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", 0)}
+        assert keys == set()
 
     def test_mooncake_master_dp_rank_missing_defaults_to_minus_one(self):
         """No DPRank key → defaults to -1."""
         service = {"InstanceID": "vllm-prefill-1"}
         keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", -1)}
+        assert keys == set()
 
     def test_mooncake_master_dp_rank_non_numeric(self):
         """DPRank is a non-numeric string → -1."""
         service = {"InstanceID": "vllm-prefill-1", "DPRank": "abc"}
         keys = ConductorApiClient._normalize_service_key(service)
-        assert keys == {("vllm-prefill-1", -1)}
+        assert keys == set()
 
     def test_mooncake_master_instance_id_empty(self):
         """Missing InstanceID → empty set."""
@@ -392,12 +416,13 @@ class TestNormalizeServiceKey:
 
 
 class TestGetRegisteredServices:
-    """Cover both kv-conductor /workers and Mooncake Master /services fallback."""
+    """Cover the strict current kv-conductor /workers contract."""
 
     def test_returns_workers_list(self):
         """kv-conductor: GET /workers returns workers list."""
         cfg = _mock_config()
-        response = {"workers": [{"instance_id": "vllm-prefill-1", "endpoints": {"0": {}}}]}
+        worker = _registered_worker()
+        response = {"workers": [worker], "indexer": []}
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -406,46 +431,25 @@ class TestGetRegisteredServices:
             mock_http.return_value.__enter__.return_value.get.return_value = response
             services = ConductorApiClient.get_registered_services()
 
-        assert services == [{"instance_id": "vllm-prefill-1", "endpoints": {"0": {}}}]
+        assert services == [worker]
 
-    def test_falls_back_to_services_when_workers_empty(self):
-        """When /workers returns no workers, fall back to /services (Mooncake Master)."""
+    def test_empty_workers_is_a_valid_cold_registry(self):
+        """An empty /workers list is authoritative and does not trigger a legacy request."""
         cfg = _mock_config()
-        mooncake_response = {"services": [{"InstanceID": "vllm-prefill-1", "DPRank": 0}]}
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
             patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
         ):
-            # /workers returns empty list → fallback to /services
-            mock_http.return_value.__enter__.return_value.get.side_effect = [
-                {"workers": []},  # /workers (empty → fallback)
-                mooncake_response,  # /services
-            ]
+            mock_client = mock_http.return_value.__enter__.return_value
+            mock_client.get.return_value = {"workers": []}
             services = ConductorApiClient.get_registered_services()
 
-        assert services == [{"InstanceID": "vllm-prefill-1", "DPRank": 0}]
+        assert services == []
+        mock_client.get.assert_called_once_with("/workers")
 
-    def test_falls_back_to_services_when_workers_fails(self):
-        """When /workers raises, fall back to /services."""
-        cfg = _mock_config()
-        mooncake_response = {"services": [{"InstanceID": "vllm-prefill-2", "DPRank": 1}]}
-
-        with (
-            patch.object(ConductorApiClient, "coordinator_config", cfg),
-            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
-        ):
-            # /workers raises ConnectionError → fallback to /services
-            mock_http.return_value.__enter__.return_value.get.side_effect = [
-                ConnectionError("conn refused"),  # /workers
-                mooncake_response,  # /services
-            ]
-            services = ConductorApiClient.get_registered_services()
-
-        assert services == [{"InstanceID": "vllm-prefill-2", "DPRank": 1}]
-
-    def test_returns_empty_when_both_fail(self):
-        """When both /workers and /services raise, return empty."""
+    def test_workers_transport_failure_propagates(self):
+        """A transport failure is unavailable evidence, not an empty registry."""
         cfg = _mock_config()
 
         with (
@@ -453,11 +457,23 @@ class TestGetRegisteredServices:
             patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
         ):
             mock_http.return_value.__enter__.return_value.get.side_effect = ConnectionError("conn refused")
-            services = ConductorApiClient.get_registered_services()
+            with pytest.raises(ConnectionError):
+                ConductorApiClient.get_registered_services()
 
-        assert services == []
+    def test_legacy_services_schema_is_rejected(self):
+        cfg = _mock_config()
 
-    def test_returns_empty_when_response_not_dict(self):
+        with (
+            patch.object(ConductorApiClient, "coordinator_config", cfg),
+            patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
+        ):
+            mock_http.return_value.__enter__.return_value.get.return_value = {
+                "services": [{"InstanceID": "legacy", "DPRank": 0}]
+            }
+            with pytest.raises(ConductorSchemaError):
+                ConductorApiClient.get_registered_services()
+
+    def test_rejects_response_not_dict(self):
         cfg = _mock_config()
 
         with (
@@ -465,9 +481,8 @@ class TestGetRegisteredServices:
             patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
         ):
             mock_http.return_value.__enter__.return_value.get.return_value = "not-a-dict"
-            services = ConductorApiClient.get_registered_services()
-
-        assert services == []
+            with pytest.raises(ConductorSchemaError):
+                ConductorApiClient.get_registered_services()
 
 
 # ------------------------------------------------------------------
@@ -492,6 +507,24 @@ class TestReRegisterKvInstances:
 
         mock_register.assert_not_called()
 
+    def test_schema_error_skips_reconciliation_without_mutation(self):
+        """Incompatible worker schema is unavailable evidence, not a cold registry."""
+        inst = _make_instance(inst_id=1, role=PDRole.ROLE_P)
+        cfg = _mock_config()
+
+        with (
+            patch.object(ConductorApiClient, "coordinator_config", cfg),
+            patch.object(
+                ConductorApiClient,
+                "get_registered_services",
+                side_effect=ConductorSchemaError("legacy services schema"),
+            ),
+            patch.object(ConductorApiClient, "register_post") as mock_register,
+        ):
+            ConductorApiClient.re_register_kv_instances([inst])
+
+        mock_register.assert_not_called()
+
     def test_skip_non_kva_roles(self):
         """ROLE_D and ROLE_E are not in _KVA_ROLES → skipped."""
         inst_d = _make_instance(inst_id=1, role=PDRole.ROLE_D)
@@ -501,25 +534,25 @@ class TestReRegisterKvInstances:
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
             patch.object(ConductorApiClient, "get_registered_services", return_value=[]),
-            patch.object(ConductorApiClient, "register_post") as mock_register,
+            patch.object(ConductorApiClient, "_register_hbm_dp") as mock_register,
         ):
             ConductorApiClient.re_register_kv_instances([inst_d, inst_e])
 
         mock_register.assert_not_called()
 
-    def test_skip_when_no_endpoints_configured(self):
-        """No endpoint patterns → _build_register_payload returns {} → skip."""
+    def test_http_only_registration_is_rebuilt(self):
+        """No event endpoint still rebuilds the registered HTTP-events tuple."""
         inst = _make_instance(inst_id=1, role=PDRole.ROLE_P)
         cfg = _mock_config(npu_endpoint="", endpoint="")
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
             patch.object(ConductorApiClient, "get_registered_services", return_value=[]),
-            patch.object(ConductorApiClient, "register_post") as mock_register,
+            patch.object(ConductorApiClient, "_register_hbm_dp") as mock_register,
         ):
             ConductorApiClient.re_register_kv_instances([inst])
 
-        mock_register.assert_not_called()
+        mock_register.assert_called_once()
 
     def test_re_registers_when_service_missing(self):
         """Instance in local but not in Conductor → register_post called."""
@@ -530,7 +563,7 @@ class TestReRegisterKvInstances:
         cfg = _mock_config(npu_endpoint="tcp://*:5557")
 
         # Conductor has a DIFFERENT instance registered
-        registered = [{"instance_id": "vllm-prefill-99", "endpoints": {"0": {}}}]
+        registered = [_registered_worker("vllm-prefill-99")]
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -550,9 +583,7 @@ class TestReRegisterKvInstances:
         cfg = _mock_config(npu_endpoint="tcp://*:5557")
 
         # Same (instance_id, dp_rank) already registered
-        registered = [
-            {"instance_id": "vllm-prefill-1", "endpoints": {"0": {"medium_endpoints": {"npu": "tcp://10.0.0.1:5557"}}}}
-        ]
+        registered = [_registered_worker()]
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -573,9 +604,7 @@ class TestReRegisterKvInstances:
         cfg = _mock_config(npu_endpoint="tcp://*:5557")
 
         # ep0 (dp_rank=0) already registered; ep1 (dp_rank=1) missing
-        registered = [
-            {"instance_id": "vllm-prefill-1", "endpoints": {"0": {"medium_endpoints": {"npu": "tcp://10.0.0.1:5557"}}}}
-        ]
+        registered = [_registered_worker(ranks=(0,))]
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -586,11 +615,11 @@ class TestReRegisterKvInstances:
 
         # Only ep1 (dp_rank=1) should trigger re-register
         assert mock_register.call_count == 1
-        called_ep = mock_register.call_args[0][1]
+        called_ep = mock_register.call_args.args[1]
         assert called_ep.id == 1
 
-    def test_skips_when_already_registered_mooncake_format(self):
-        """Instance already registered (Mooncake Master format) → skip."""
+    def test_legacy_mooncake_format_fails_closed(self):
+        """Legacy Mooncake registration evidence causes no mutation."""
         ep = _make_endpoint(ep_id=0, ip="10.0.0.1")
         endpoints = {"pod-0": {0: ep}}
         inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
@@ -609,8 +638,8 @@ class TestReRegisterKvInstances:
 
         mock_register.assert_not_called()
 
-    def test_re_registers_missing_mooncake_format(self):
-        """Instance missing (Mooncake Master format) → register_post called."""
+    def test_legacy_mooncake_format_never_triggers_repair(self):
+        """A legacy response is unavailable, not evidence that a tuple is missing."""
         ep = _make_endpoint(ep_id=0, ip="10.0.0.1")
         endpoints = {"pod-0": {0: ep}}
         inst = Instance(id=1, role=PDRole.ROLE_P, model_name="qwen", job_name="test-job", endpoints=endpoints)
@@ -627,7 +656,7 @@ class TestReRegisterKvInstances:
         ):
             ConductorApiClient.re_register_kv_instances([inst])
 
-        mock_register.assert_called_once_with(inst, ep, 0)
+        mock_register.assert_not_called()
 
 
 # ── Registration dispatch tests ──────────────────────────────────────
@@ -1207,7 +1236,7 @@ def test_re_register_node_pool_only_leaves_live_dps_alone(mock_http):
         mock_client.post.reset_mock()
 
         # The conductor still holds both DPs but no longer the pool entry.
-        workers = [{"instance_id": "vllm-prefill-1", "endpoints": {"0": {}, "1": {}}}]
+        workers = [_registered_worker("vllm-prefill-1", "test-model", (0, 1))]
         with patch.object(ConductorApiClient, "get_registered_services", return_value=workers):
             ConductorApiClient.re_register_kv_instances([instance])
 
@@ -1303,7 +1332,7 @@ def test_re_register_missing_expanded_sglang_dp_rank(mock_http):
     instance = _make_single_http_dp_instance(1, dp_size=4)
     cfg = _mock_config(npu_endpoint="tcp://*:5557")
     # Only dp 0 is known to conductor; ranks 1-3 must be rebuilt.
-    registered = [{"instance_id": "sglang-prefill-1", "endpoints": {"0": {}}}]
+    registered = [_registered_worker("sglang-prefill-1", "test-model", (0,))]
     with (
         patch.object(ConductorApiClient, "coordinator_config", cfg),
         patch.object(ConductorApiClient, "get_registered_services", return_value=registered),

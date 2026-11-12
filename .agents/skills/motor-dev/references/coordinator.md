@@ -232,6 +232,24 @@ decoded by Content-Type (msgpack via `msgspec`, otherwise JSON — legacy
 JSON responses can still be decoded). Request encoding does not automatically downgrade:
 set `query_encoding: "json"` explicitly for JSON-only conductor binaries.
 
+**Strict scheduling-evidence boundary**
+(`api_client/conductor_evidence.py`) is additive and is not wired into the
+existing KVA hot path. It accepts only the current lowercase `/workers` schema
+and the current query schema, validates one model/static tenant/unified block
+size, and treats an omitted registered tuple as zero. Missing registration,
+namespace mismatch, invalid schema, or query failure invalidates the complete
+evidence set. NPU credit is available only when the server supplies
+`exact_dp_npu_provenance=true`; missing/false provenance is valid but yields
+zero creditable NPU blocks. For unavailable evidence, load-balancer fallback is
+permitted only before admission with a provable TARS mutation count of zero;
+otherwise the later stateful layer must use STATUS/revocation and fail closed.
+
+Conductor registration/reconciliation uses the runtime instance model for pool
+and per-DP registrations, rejects mixed runtime models, queries only `/workers`
+(never legacy `/services`), and treats a valid empty `/workers` response as a
+control-plane restart requiring cold pool/per-DP re-registration. Worker
+presence is not cache readiness and does not imply warm-hit preservation.
+
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
 The policy is selected per role by `SchedulerConfig.type_for_role()`: `prefill_scheduler_type` serves Prefill, Encode and Union; `decode_scheduler_type` serves Decode. Both default to `LOAD_BALANCE`; Decode supports load balance / round robin / dynamic bucket, while KV affinity applies only to P/U. Deprecated `scheduler_type` migrates only to role fields that are not explicitly configured. When a role uses `kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:

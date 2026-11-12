@@ -272,6 +272,9 @@ pub struct DpBlocks {
     pub cpu_end: u32,
     /// Absolute Disk coverage end (blocks), before exclusive partition.
     pub disk_end: u32,
+    /// Server-owned capability: NPU data for this tuple came from an exact-DP
+    /// subscriber rather than HTTP-only or IP-fanout ingestion.
+    pub exact_dp_npu_provenance: bool,
 }
 
 /// Per-instance match data returned in query response.
@@ -358,7 +361,7 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 .expect("write map len");
             for (rank, blocks) in &data.dp {
                 write_str(out, rank).expect("write rank");
-                write_map_len(out, 7).expect("blocks map len");
+                write_map_len(out, 8).expect("blocks map len");
                 write_str(out, "matched_tokens").expect("write key");
                 write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
                 write_str(out, "npu_blocks").expect("write key");
@@ -373,6 +376,8 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 write_u32(out, blocks.cpu_end).expect("write cpu_end");
                 write_str(out, "disk_end").expect("write key");
                 write_u32(out, blocks.disk_end).expect("write disk_end");
+                write_str(out, "exact_dp_npu_provenance").expect("write key");
+                write_bool(out, blocks.exact_dp_npu_provenance).expect("write provenance");
             }
         }
     }
@@ -796,6 +801,7 @@ mod tests {
                 npu_end: 6,
                 cpu_end: 6,
                 disk_end: 0,
+                exact_dp_npu_provenance: true,
             },
         );
         imd.dp.insert(
@@ -808,6 +814,7 @@ mod tests {
                 npu_end: 0,
                 cpu_end: 4,
                 disk_end: 0,
+                exact_dp_npu_provenance: false,
             },
         );
 
@@ -823,9 +830,15 @@ mod tests {
         assert_eq!(parsed["DP"]["0"]["cpu_blocks"], 0);
         assert_eq!(parsed["DP"]["0"]["npu_end"], 6);
         assert_eq!(parsed["DP"]["0"]["cpu_end"], 6);
+        assert!(parsed["DP"]["0"]["exact_dp_npu_provenance"]
+            .as_bool()
+            .unwrap());
         assert_eq!(parsed["DP"]["1"]["matched_tokens"], 1024);
         assert_eq!(parsed["DP"]["1"]["cpu_blocks"], 4);
         assert_eq!(parsed["DP"]["1"]["cpu_end"], 4);
+        assert!(!parsed["DP"]["1"]["exact_dp_npu_provenance"]
+            .as_bool()
+            .unwrap());
     }
 
     // ── KvEventWirePayload normalization ────────────────────────────────
@@ -1052,6 +1065,7 @@ mod tests {
                 npu_end: 3,
                 cpu_end: 3,
                 disk_end: 0,
+                exact_dp_npu_provenance: true,
             },
         );
         dp.insert(
@@ -1064,6 +1078,7 @@ mod tests {
                 npu_end: 1,
                 cpu_end: 4,
                 disk_end: 0,
+                exact_dp_npu_provenance: false,
             },
         );
         instances.insert(
@@ -1092,6 +1107,19 @@ mod tests {
         assert_eq!(
             msgpack_json, json_value,
             "msgpack response diverges from JSON wire shape"
+        );
+
+        // The Python evidence adapter decodes these same fixtures. Check them
+        // against both real serializers so client mocks cannot hide schema drift.
+        let json_fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/query_response.json")).unwrap();
+        let mut msgpack_fixture = include_bytes!("../tests/fixtures/query_response.msgpack").as_slice();
+        let fixture_value = rmpv::decode::read_value(&mut msgpack_fixture).unwrap();
+        assert_eq!(json_fixture, json_value, "JSON contract fixture is stale");
+        assert_eq!(
+            rmpv_to_json(&fixture_value),
+            msgpack_json,
+            "MessagePack contract fixture is stale"
         );
     }
 

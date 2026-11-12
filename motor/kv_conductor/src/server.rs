@@ -93,6 +93,10 @@ async fn register_handler(
             StatusCode::CREATED,
             Json(serde_json::json!({"status": "ok"})),
         ),
+        Err(error @ KvConductorError::RegistrationIdentityConflict { .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": error.to_string()})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -192,7 +196,8 @@ fn ok_query_response(response: QueryResponse, msgpack: bool) -> Response {
 ///
 /// Response: `{ "<tenant_id>": { "<instance_id>": { "longest_matched": N,
 /// "DP": { "<rank>": { "matched_tokens": N, "npu_blocks": N,
-/// "cpu_blocks": N, "disk_blocks": N } } } } }`
+/// "cpu_blocks": N, "disk_blocks": N,
+/// "exact_dp_npu_provenance": bool } } } } }`
 ///
 /// Both JSON (default) and MessagePack (`Content-Type: application/msgpack`)
 /// encodings are accepted; the response is returned in the request's encoding.
@@ -308,6 +313,7 @@ async fn events_handler(
 
     let mut total_applied = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let mut response_status = StatusCode::OK;
 
     let mut i = 0;
     while i < batch.events.len() {
@@ -329,6 +335,20 @@ async fn events_handler(
             .await
         {
             Ok(n) => total_applied += n,
+            Err(error @ KvConductorError::InstanceNotFound { .. }) => {
+                tracing::warn!(
+                    instance_id = %batch.instance_id,
+                    dp_rank,
+                    error = %error,
+                    "failed to apply events"
+                );
+                errors.push(format!("dp_rank={}: {}", dp_rank, error));
+                if total_applied == 0 {
+                    response_status = StatusCode::NOT_FOUND;
+                } else {
+                    response_status = StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     instance_id = %batch.instance_id,
@@ -337,6 +357,7 @@ async fn events_handler(
                     "failed to apply events"
                 );
                 errors.push(format!("dp_rank={}: {}", dp_rank, e));
+                response_status = StatusCode::INTERNAL_SERVER_ERROR;
             }
         }
         i = j;
@@ -354,8 +375,11 @@ async fn events_handler(
     }
 
     if !errors.is_empty() {
+        if total_applied > 0 {
+            response_status = StatusCode::INTERNAL_SERVER_ERROR;
+        }
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            response_status,
             Json(serde_json::json!({
                 "status": "partial",
                 "events_applied": total_applied,

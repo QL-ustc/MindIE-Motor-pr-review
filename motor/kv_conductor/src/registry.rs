@@ -13,9 +13,10 @@
 //! Manages instance registration, unregistration, ZMQ subscriptions for
 //! Mooncake-type publishers, and provides the query interface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use parking_lot::RwLock as ParkingRwLock;
 
 use crate::backend::{MatchMode, StoreBackend};
@@ -52,13 +53,33 @@ fn add_hbm_ip_index_entries(
         let Some(ref ip) = extract_ip_from_endpoint(ep_url) else {
             continue;
         };
-        ip_index
-            .write()
-            .entry(ip.clone())
-            .or_default()
-            .push((instance_id.to_string(), dp_rank));
+        let target = (instance_id.to_string(), dp_rank);
+        let mut index = ip_index.write();
+        let dps = index.entry(ip.clone()).or_default();
+        let mut found = false;
+        dps.retain(|candidate| {
+            if candidate != &target {
+                return true;
+            }
+            if found {
+                return false;
+            }
+            found = true;
+            true
+        });
+        if !found {
+            dps.push(target);
+        }
         tracing::info!(instance_id = %instance_id, dp_rank, ip = %ip, "HBM IP indexed for pool auto-attach");
     }
+}
+
+fn hbm_ips(medium_endpoints: &HashMap<String, String>) -> HashSet<String> {
+    medium_endpoints
+        .iter()
+        .filter(|(medium, _)| StorageMedium::is_hbm_key(medium))
+        .filter_map(|(_, endpoint)| extract_ip_from_endpoint(endpoint))
+        .collect()
 }
 
 /// For each NPU endpoint in `medium_endpoints`, remove the (instance_id, dp_rank)
@@ -86,6 +107,24 @@ fn remove_hbm_ip_index_entries(
         }
         tracing::info!(instance_id = %instance_id, dp_rank, ip = %ip, "HBM IP removed from index");
     }
+}
+
+fn remove_stale_hbm_ip_index_entries(
+    ip_index: &HbmIpIndex,
+    old_medium_endpoints: &HashMap<String, String>,
+    retained_ips: &HashSet<String>,
+    instance_id: &str,
+    dp_rank: u32,
+) {
+    let stale_endpoints = old_medium_endpoints
+        .iter()
+        .filter(|(medium, endpoint)| {
+            StorageMedium::is_hbm_key(medium)
+                && extract_ip_from_endpoint(endpoint).is_some_and(|ip| !retained_ips.contains(&ip))
+        })
+        .map(|(medium, endpoint)| (medium.clone(), endpoint.clone()))
+        .collect();
+    remove_hbm_ip_index_entries(ip_index, &stale_endpoints, instance_id, dp_rank);
 }
 
 /// Matching strategy and IP-index requirement for the ZMQ producers of a
@@ -116,6 +155,10 @@ pub struct EndpointInfo {
     pub engine_type: String,
     pub dp_rank: DpRank,
     pub replay_endpoint: Option<String>,
+    /// Server-owned capability: NPU data is accepted only from an exact-DP
+    /// subscriber path for this tuple. HTTP NPU ingestion permanently
+    /// downgrades the capability until the tuple is re-registered.
+    pub exact_dp_npu_provenance: bool,
 }
 
 /// A registered worker entry.
@@ -126,6 +169,9 @@ pub struct WorkerEntry {
     pub tenant_id: String,
     pub block_size: u32,
     pub store_backend: String,
+    /// Per-DP backend identity. The public `store_backend` field retains its
+    /// historical last-registration value for compatibility.
+    store_backends: HashMap<DpRank, String>,
     /// dp_rank -> EndpointInfo
     pub endpoints: HashMap<DpRank, EndpointInfo>,
 }
@@ -151,6 +197,12 @@ pub struct WorkerRegistry {
     /// Built from HBM endpoint registrations; consumed by the pool subscriber
     /// to map `backend_id` in events to the correct DP(s).
     hbm_ip_index: HbmIpIndex,
+    /// Serializes lifecycle transitions per instance while allowing unrelated
+    /// instances to proceed during subscriber shutdown or replay.
+    lifecycle_locks: DashMap<InstanceId, Arc<tokio::sync::Mutex<()>>>,
+    /// Test seam for exercising registration metadata and IP-index lifecycle
+    /// without creating background ZMQ tasks.
+    subscriber_connections_enabled: bool,
 }
 
 impl WorkerRegistry {
@@ -205,6 +257,62 @@ impl WorkerRegistry {
             indexer: Arc::new(Indexer::with_config(config)),
             zmq_subscribers: tokio::sync::RwLock::new(HashMap::new()),
             hbm_ip_index: Arc::new(ParkingRwLock::new(HashMap::new())),
+            lifecycle_locks: DashMap::new(),
+            subscriber_connections_enabled: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_subscriber_connections() -> Self {
+        Self {
+            instances: tokio::sync::RwLock::new(HashMap::new()),
+            indexer: Arc::new(Indexer::new()),
+            zmq_subscribers: tokio::sync::RwLock::new(HashMap::new()),
+            hbm_ip_index: Arc::new(ParkingRwLock::new(HashMap::new())),
+            lifecycle_locks: DashMap::new(),
+            subscriber_connections_enabled: false,
+        }
+    }
+
+    fn lifecycle_lock(&self, instance_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.lifecycle_locks
+                .entry(instance_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .value(),
+        )
+    }
+
+    fn release_lifecycle_lock_if_unused(
+        &self,
+        instance_id: &str,
+        lifecycle_lock: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.lifecycle_locks.remove_if(instance_id, |_, current| {
+            Arc::ptr_eq(current, lifecycle_lock) && Arc::strong_count(current) == 2
+        });
+    }
+
+    async fn take_subscribers(
+        &self,
+        instance_id: &str,
+        dp_rank: u32,
+    ) -> Vec<crate::zmq_subscriber::ZmqSubscriber> {
+        let mut subscribers = self.zmq_subscribers.write().await;
+        let matching: Vec<_> = subscribers
+            .keys()
+            .filter(|(iid, dp, _)| iid == instance_id && dp == &dp_rank)
+            .cloned()
+            .collect();
+        matching
+            .into_iter()
+            .filter_map(|key| subscribers.remove(&key))
+            .collect()
+    }
+
+    async fn shutdown_subscribers(subscribers: Vec<crate::zmq_subscriber::ZmqSubscriber>) {
+        for subscriber in subscribers {
+            subscriber.shutdown().await;
         }
     }
 
@@ -220,74 +328,83 @@ impl WorkerRegistry {
         let is_pool =
             (sb.is_pool_auto_attach() && req.medium_endpoints.is_empty() && req.endpoint.is_some())
                 || sb.is_node_pool_registration(&req.medium_endpoints);
+        let exact_dp_npu_provenance = !is_pool
+            && endpoint_media
+                .values()
+                .flatten()
+                .any(|medium| *medium == StorageMedium::Npu);
 
-        // Detect whether this instance_id already exists (for replay gating).
-        let instance_exists = {
+        let lifecycle_lock = self.lifecycle_lock(&req.instance_id);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let old_registration = {
             let instances = self.instances.read().await;
-            instances.contains_key(&req.instance_id)
-        };
-
-        // ── Handle re-registration ────────────────────────────────────
-        // If the same (instance_id, dp_rank) is already registered, stop the
-        // old ZMQ subscribers.  If the backend type changed, drop the radix
-        // tree data for the old registration.  If the backend is the same,
-        // the tree data is preserved and only endpoint info is updated.
-        // This allows clients to fix misconfigured endpoints by simply
-        // re-registering, without a restart or explicit unregister.
-        {
-            let old_info: Option<(bool, HashMap<String, String>)> = {
-                let instances = self.instances.read().await;
-                let entry = instances.get(&req.instance_id);
-                entry.and_then(|e| {
-                    e.endpoints.get(&req.dp_rank).map(|info| {
-                        (
-                            !e.store_backend.eq_ignore_ascii_case(&req.store_backend),
-                            info.medium_endpoints.clone(),
-                        )
-                    })
-                })
-            };
-
-            if let Some((backend_changed, old_medium_endpoints)) = old_info {
-                tracing::info!(
-                    instance_id = %req.instance_id,
-                    dp_rank = req.dp_rank,
-                    old_backend = %req.store_backend,
-                    backend_changed,
-                    "re-registering existing worker"
-                );
-
-                // Stop old subscribers.
-                let mut subs = self.zmq_subscribers.write().await;
-                let matching: Vec<_> = subs
-                    .keys()
-                    .filter(|(iid, dp, _)| iid == &req.instance_id && dp == &req.dp_rank)
-                    .cloned()
-                    .collect();
-                for key in matching {
-                    if let Some(subscriber) = subs.remove(&key) {
-                        subscriber.shutdown().await;
-                    }
+            if let Some(existing) = instances.get(&req.instance_id) {
+                if existing.model_name != req.modelname
+                    || existing.tenant_id != req.tenant_id
+                    || existing.block_size != req.block_size
+                {
+                    return Err(KvConductorError::RegistrationIdentityConflict {
+                        instance_id: req.instance_id.clone(),
+                        dp_rank: req.dp_rank,
+                        reason: format!(
+                            "registered model={} tenant={} block_size={}, requested model={} tenant={} block_size={}",
+                            existing.model_name,
+                            existing.tenant_id,
+                            existing.block_size,
+                            req.modelname,
+                            req.tenant_id,
+                            req.block_size
+                        ),
+                    });
                 }
-                drop(subs);
+            }
+            instances.get(&req.instance_id).and_then(|entry| {
+                entry.endpoints.get(&req.dp_rank).map(|endpoint| {
+                    let old_backend = entry
+                        .store_backends
+                        .get(&req.dp_rank)
+                        .unwrap_or(&entry.store_backend)
+                        .clone();
+                    (old_backend, endpoint.medium_endpoints.clone())
+                })
+            })
+        };
+        let tuple_exists = old_registration.is_some();
 
-                // Drop radix tree data if backend changed.
-                if backend_changed {
-                    let ie = self.indexer.get(&req.modelname, &req.tenant_id);
-                    if let Some(ie) = &ie {
-                        ie.remove_worker_all_media(&req.instance_id, req.dp_rank);
-                    }
-                    remove_hbm_ip_index_entries(
-                        &self.hbm_ip_index,
-                        &old_medium_endpoints,
-                        &req.instance_id,
-                        req.dp_rank,
-                    );
+        if let Some((old_backend, old_medium_endpoints)) = &old_registration {
+            tracing::info!(
+                instance_id = %req.instance_id,
+                dp_rank = req.dp_rank,
+                old_backend = %old_backend,
+                new_backend = %req.store_backend,
+                "re-registering existing worker"
+            );
+
+            let old_subscribers = self.take_subscribers(&req.instance_id, req.dp_rank).await;
+            Self::shutdown_subscribers(old_subscribers).await;
+
+            let retained_hbm_ips = if sb.index_hbm_ip() && !is_pool {
+                hbm_ips(&req.medium_endpoints)
+            } else {
+                HashSet::new()
+            };
+            remove_stale_hbm_ip_index_entries(
+                &self.hbm_ip_index,
+                old_medium_endpoints,
+                &retained_hbm_ips,
+                &req.instance_id,
+                req.dp_rank,
+            );
+
+            if let Some(indexer_entry) = self.indexer.get(&req.modelname, &req.tenant_id) {
+                if old_backend.eq_ignore_ascii_case(&req.store_backend) {
+                    indexer_entry.remove_worker_hbm(&req.instance_id, req.dp_rank);
+                } else {
+                    indexer_entry.remove_worker_all_media(&req.instance_id, req.dp_rank);
                 }
             }
         }
 
-        // Index HBM endpoint IPs for pool backends.
         if sb.index_hbm_ip() && !is_pool {
             add_hbm_ip_index_entries(
                 &self.hbm_ip_index,
@@ -317,30 +434,34 @@ impl WorkerRegistry {
             None
         };
 
-        // Pre-create ZMQ subscribers before acquiring write lock.
-        let subscribers: Vec<(String, crate::zmq_subscriber::ZmqSubscriber)> = {
-            let mut subs = Vec::with_capacity(endpoint_media.len());
-            for (ep_url, default_media) in &endpoint_media {
-                // Engine publishers expose HBM/NPU events; CPU and Disk
-                // endpoints are pool publishers and use PoolEvent wire data.
-                let event_source = crate::zmq_subscriber::event_source_for_media(default_media);
-                let sub = crate::zmq_subscriber::ZmqSubscriber::connect(
-                    ep_url.clone(),
-                    req.modelname.clone(),
-                    req.tenant_id.clone(),
-                    Arc::clone(&self.indexer),
-                    req.block_size,
-                    backend_id.clone(),
-                    req.dp_rank,
-                    default_media.clone(),
-                    event_source,
-                    match_mode,
-                    ip_index.clone(),
-                )?;
-                subs.push((ep_url.clone(), sub));
-            }
-            subs
-        };
+        // Start replacement subscribers before acquiring the instances write
+        // lock; only the test seam disables real ZMQ connections.
+        let subscribers: Vec<(String, crate::zmq_subscriber::ZmqSubscriber)> =
+            if self.subscriber_connections_enabled {
+                let mut subs = Vec::with_capacity(endpoint_media.len());
+                for (ep_url, default_media) in &endpoint_media {
+                    // Engine publishers expose HBM/NPU events; CPU and Disk
+                    // endpoints are pool publishers and use PoolEvent wire data.
+                    let event_source = crate::zmq_subscriber::event_source_for_media(default_media);
+                    let sub = crate::zmq_subscriber::ZmqSubscriber::connect(
+                        ep_url.clone(),
+                        req.modelname.clone(),
+                        req.tenant_id.clone(),
+                        Arc::clone(&self.indexer),
+                        req.block_size,
+                        backend_id.clone(),
+                        req.dp_rank,
+                        default_media.clone(),
+                        event_source,
+                        match_mode,
+                        ip_index.clone(),
+                    )?;
+                    subs.push((ep_url.clone(), sub));
+                }
+                subs
+            } else {
+                Vec::new()
+            };
 
         // Build normalized medium_endpoints for storage.
         let mut normalized_mediums: HashMap<String, String> = HashMap::new();
@@ -352,28 +473,35 @@ impl WorkerRegistry {
 
         self.indexer.get_or_create(&req.modelname, &req.tenant_id);
 
-        let mut instances = self.instances.write().await;
-        let entry = instances
-            .entry(req.instance_id.clone())
-            .or_insert_with(|| WorkerEntry {
-                instance_id: req.instance_id.clone(),
-                model_name: req.modelname.clone(),
-                tenant_id: req.tenant_id.clone(),
-                block_size: req.block_size,
-                store_backend: req.store_backend.clone(),
-                endpoints: HashMap::new(),
-            });
+        {
+            let mut instances = self.instances.write().await;
+            let entry = instances
+                .entry(req.instance_id.clone())
+                .or_insert_with(|| WorkerEntry {
+                    instance_id: req.instance_id.clone(),
+                    model_name: req.modelname.clone(),
+                    tenant_id: req.tenant_id.clone(),
+                    block_size: req.block_size,
+                    store_backend: req.store_backend.clone(),
+                    store_backends: HashMap::new(),
+                    endpoints: HashMap::new(),
+                });
 
-        entry.store_backend = req.store_backend.clone();
-        entry.endpoints.insert(
-            req.dp_rank,
-            EndpointInfo {
-                medium_endpoints: normalized_mediums,
-                engine_type: req.engine_type.clone(),
-                dp_rank: req.dp_rank,
-                replay_endpoint: req.replay_endpoint.clone(),
-            },
-        );
+            entry.store_backend = req.store_backend.clone();
+            entry
+                .store_backends
+                .insert(req.dp_rank, req.store_backend.clone());
+            entry.endpoints.insert(
+                req.dp_rank,
+                EndpointInfo {
+                    medium_endpoints: normalized_mediums,
+                    engine_type: req.engine_type.clone(),
+                    dp_rank: req.dp_rank,
+                    replay_endpoint: req.replay_endpoint.clone(),
+                    exact_dp_npu_provenance,
+                },
+            );
+        }
 
         tracing::info!(
             instance_id = %req.instance_id, dp_rank = req.dp_rank,
@@ -391,7 +519,10 @@ impl WorkerRegistry {
         }
 
         if let Some(ref replay_ep) = req.replay_endpoint {
-            if !replay_ep.is_empty() && !instance_exists {
+            // Exact-tuple re-registration deliberately skips replay after the
+            // old NPU generation was invalidated above. Replay is not a
+            // complete warm snapshot, so event-driven rebuild is safer.
+            if !replay_ep.is_empty() && !tuple_exists {
                 let replay_ep = replay_ep.clone();
                 let modelname = req.modelname.clone();
                 let tenant_id = req.tenant_id.clone();
@@ -400,9 +531,9 @@ impl WorkerRegistry {
                 let replay_backend_id = backend_id.clone();
                 let ip_index = ip_index.clone();
 
-                // Offload blocking ZMQ I/O to a dedicated thread so the
-                // tokio runtime worker is not starved during replay.
-                tokio::task::spawn_blocking(move || {
+                // Keep replay ordered with this instance's lifecycle while
+                // offloading blocking ZMQ I/O from the tokio runtime.
+                let replay_result = tokio::task::spawn_blocking(move || {
                     crate::zmq_subscriber::replay_events(
                         &replay_ep,
                         &modelname,
@@ -418,7 +549,15 @@ impl WorkerRegistry {
                         match_mode,
                         &ip_index,
                     );
-                });
+                })
+                .await;
+                if let Err(error) = replay_result {
+                    tracing::warn!(
+                        instance_id = %req.instance_id,
+                        dp_rank = req.dp_rank,
+                        "replay task failed: {error}"
+                    );
+                }
             }
         }
 
@@ -427,65 +566,51 @@ impl WorkerRegistry {
 
     /// Unregister a worker endpoint.
     pub async fn unregister(&self, req: &UnregisterRequest) -> Result<(), KvConductorError> {
-        // Remove HBM IP index entries for this DP.
-        {
+        let lifecycle_lock = self.lifecycle_lock(&req.instance_id);
+        let lifecycle_guard = lifecycle_lock.lock().await;
+        let registration = {
             let instances = self.instances.read().await;
-            if let Some(entry) = instances.get(&req.instance_id) {
-                if let Some(info) = entry.endpoints.get(&req.dp_rank) {
-                    remove_hbm_ip_index_entries(
-                        &self.hbm_ip_index,
-                        &info.medium_endpoints,
-                        &req.instance_id,
-                        req.dp_rank,
-                    );
-                }
-            }
-        }
-
-        // Shut down ALL ZMQ subscribers for this (instance_id, dp_rank).
-        // A single dp_rank may have multiple subscribers when the backend
-        // uses separate ports per storage medium.
-        {
-            let mut subs = self.zmq_subscribers.write().await;
-            // Collect keys matching this (instance_id, dp_rank)
-            let matching_keys: Vec<(InstanceId, DpRank, String)> = subs
-                .keys()
-                .filter(|(iid, dp, _)| iid == &req.instance_id && dp == &req.dp_rank)
-                .cloned()
-                .collect();
-            for key in matching_keys {
-                if let Some(subscriber) = subs.remove(&key) {
-                    subscriber.shutdown().await;
-                    tracing::info!(
-                        instance_id = %req.instance_id,
-                        dp_rank = req.dp_rank,
-                        endpoint = %key.2,
-                        "ZMQ subscriber stopped"
-                    );
-                }
-            }
-        }
-
-        let mut instances = self.instances.write().await;
-
-        let entry = instances.get_mut(&req.instance_id).ok_or_else(|| {
-            KvConductorError::InstanceNotFound {
+            instances.get(&req.instance_id).and_then(|entry| {
+                entry.endpoints.get(&req.dp_rank).map(|endpoint| {
+                    (
+                        entry.model_name.clone(),
+                        entry.tenant_id.clone(),
+                        endpoint.medium_endpoints.clone(),
+                    )
+                })
+            })
+        };
+        let Some((registered_model, registered_tenant, old_medium_endpoints)) = registration else {
+            drop(lifecycle_guard);
+            self.release_lifecycle_lock_if_unused(&req.instance_id, &lifecycle_lock);
+            return Err(KvConductorError::InstanceNotFound {
                 instance_id: req.instance_id.clone(),
-            }
-        })?;
+            });
+        };
 
-        let registered_model = entry.model_name.clone();
-        let registered_tenant = entry.tenant_id.clone();
-
-        entry.endpoints.remove(&req.dp_rank);
+        let old_subscribers = self.take_subscribers(&req.instance_id, req.dp_rank).await;
+        Self::shutdown_subscribers(old_subscribers).await;
+        remove_hbm_ip_index_entries(
+            &self.hbm_ip_index,
+            &old_medium_endpoints,
+            &req.instance_id,
+            req.dp_rank,
+        );
 
         // Remove from indexer tree across all storage media (NPU/CPU/DISK)
         // Use the *registered* model/tenant (not the request's) to ensure
         // cleanup targets the correct indexer entry.
-        let indexer_entry = self.indexer.get(&entry.model_name, &entry.tenant_id);
+        let indexer_entry = self.indexer.get(&registered_model, &registered_tenant);
         if let Some(ie) = &indexer_entry {
             ie.remove_worker_all_media(&req.instance_id, req.dp_rank);
         }
+
+        let mut instances = self.instances.write().await;
+        let entry = instances
+            .get_mut(&req.instance_id)
+            .expect("per-instance lifecycle lock keeps registration present");
+        entry.endpoints.remove(&req.dp_rank);
+        entry.store_backends.remove(&req.dp_rank);
 
         tracing::info!(
             instance_id = %req.instance_id,
@@ -493,10 +618,17 @@ impl WorkerRegistry {
             "worker unregistered"
         );
 
-        if entry.endpoints.is_empty() {
+        let removed_instance = entry.endpoints.is_empty();
+        if removed_instance {
             instances.remove(&req.instance_id);
             self.indexer
                 .remove_if_empty(&registered_model, &registered_tenant);
+        }
+        drop(instances);
+        drop(lifecycle_guard);
+
+        if removed_instance {
+            self.release_lifecycle_lock_if_unused(&req.instance_id, &lifecycle_lock);
         }
 
         Ok(())
@@ -504,8 +636,11 @@ impl WorkerRegistry {
 
     /// Query KV cache overlap for a token sequence.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, KvConductorError> {
-        self.indexer
-            .query(&req.model, &req.tenant_id, &req.token_ids, req.block_size)
+        let result = self
+            .indexer
+            .query(&req.model, &req.tenant_id, &req.token_ids, req.block_size);
+        self.finish_query(result, &req.model, &req.tenant_id, req.block_size)
+            .await
     }
 
     /// Query KV cache overlap using pre-computed block hashes.
@@ -518,15 +653,85 @@ impl WorkerRegistry {
             .iter()
             .map(|&h| LocalBlockHash(h))
             .collect();
-        self.indexer
-            .query_by_hash(&req.model, &req.tenant_id, &hashes)
+        let result = self
+            .indexer
+            .query_by_hash(&req.model, &req.tenant_id, &hashes);
+        self.finish_query(result, &req.model, &req.tenant_id, req.block_size)
+            .await
+    }
+
+    async fn finish_query(
+        &self,
+        result: Result<QueryResponse, KvConductorError>,
+        model_name: &str,
+        tenant_id: &str,
+        block_size: u32,
+    ) -> Result<QueryResponse, KvConductorError> {
+        let mut response = match result {
+            Ok(response) => response,
+            Err(KvConductorError::NoWorkers { .. })
+                if self
+                    .has_registered_namespace(model_name, tenant_id, block_size)
+                    .await =>
+            {
+                let mut response = QueryResponse::default();
+                response
+                    .tenants
+                    .insert(tenant_id.to_string(), HashMap::new());
+                response
+            }
+            Err(error) => return Err(error),
+        };
+        self.annotate_exact_dp_provenance(&mut response).await;
+        Ok(response)
+    }
+
+    async fn has_registered_namespace(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        block_size: u32,
+    ) -> bool {
+        self.instances.read().await.values().any(|entry| {
+            entry.model_name == model_name
+                && entry.tenant_id == tenant_id
+                && entry.block_size == block_size
+                && !entry.endpoints.is_empty()
+        })
+    }
+
+    async fn annotate_exact_dp_provenance(&self, response: &mut QueryResponse) {
+        let instances = self.instances.read().await;
+        for (tenant_id, response_instances) in &mut response.tenants {
+            for (instance_id, match_data) in response_instances {
+                let Some(entry) = instances.get(instance_id) else {
+                    continue;
+                };
+                if entry.tenant_id != *tenant_id {
+                    continue;
+                }
+                for (dp_rank, blocks) in &mut match_data.dp {
+                    let Ok(dp_rank) = dp_rank.parse::<u32>() else {
+                        continue;
+                    };
+                    blocks.exact_dp_npu_provenance = entry
+                        .endpoints
+                        .get(&dp_rank)
+                        .is_some_and(|endpoint| endpoint.exact_dp_npu_provenance);
+                }
+            }
+        }
     }
 
     /// Apply a batch of KV cache events (engine-style, HTTP POST /events).
     ///
+    /// The tuple must already be registered. This keeps NPU provenance
+    /// server-owned: a client cannot seed indexer state before registration
+    /// and then inherit the registration's exact-DP capability.
+    ///
     /// When `model_name` / `tenant_id` are provided, they take precedence over
-    /// the registered values. If neither a registration nor explicit model
-    /// exist, the call returns [`KvConductorError::InstanceNotFound`].
+    /// the registered values. An unregistered tuple always returns
+    /// [`KvConductorError::InstanceNotFound`] without creating indexer state.
     pub async fn apply_events(
         &self,
         instance_id: &str,
@@ -535,24 +740,26 @@ impl WorkerRegistry {
         model_name: Option<&str>,
         tenant_id: Option<&str>,
     ) -> Result<usize, KvConductorError> {
-        // Resolve model_name / tenant_id:
-        //   explicit args > registered values > defaults
-        let (model_name, tenant_id) = {
-            let instances = self.instances.read().await;
-            match instances.get(instance_id) {
-                Some(entry) => (
+        // Resolve model_name / tenant_id from the registered tuple. Explicit
+        // values may narrow the registered namespace but cannot create one.
+        let (model_name, tenant_id) =
+            {
+                let instances = self.instances.read().await;
+                let entry = instances.get(instance_id).ok_or_else(|| {
+                    KvConductorError::InstanceNotFound {
+                        instance_id: instance_id.to_string(),
+                    }
+                })?;
+                entry.endpoints.get(&dp_rank).ok_or_else(|| {
+                    KvConductorError::InstanceNotFound {
+                        instance_id: instance_id.to_string(),
+                    }
+                })?;
+                (
                     model_name.unwrap_or(&entry.model_name).to_string(),
                     tenant_id.unwrap_or(&entry.tenant_id).to_string(),
-                ),
-                None => {
-                    let mn = model_name.ok_or_else(|| KvConductorError::InstanceNotFound {
-                        instance_id: instance_id.to_string(),
-                    })?;
-                    let tid = tenant_id.unwrap_or("default");
-                    (mn.to_string(), tid.to_string())
-                }
-            }
-        };
+                )
+            };
 
         let indexer_entry = self.indexer.get_or_create(&model_name, &tenant_id);
 
@@ -580,6 +787,16 @@ impl WorkerRegistry {
                 .as_deref()
                 .map(StorageMedium::parse)
                 .unwrap_or(StorageMedium::Npu);
+
+            if medium == StorageMedium::Npu {
+                let mut instances = self.instances.write().await;
+                if let Some(endpoint) = instances
+                    .get_mut(instance_id)
+                    .and_then(|entry| entry.endpoints.get_mut(&dp_rank))
+                {
+                    endpoint.exact_dp_npu_provenance = false;
+                }
+            }
 
             let backend_id = backend_id_opt.as_deref().unwrap_or(instance_id).to_string();
 
@@ -658,6 +875,94 @@ use serde::Serialize;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn register_request(
+        instance_id: &str,
+        dp_rank: u32,
+        ip: Option<&str>,
+        store_backend: &str,
+    ) -> RegisterRequest {
+        RegisterRequest {
+            instance_id: instance_id.to_string(),
+            medium_endpoints: ip
+                .map(|ip| HashMap::from([("npu".to_string(), format!("tcp://{ip}:50090"))]))
+                .unwrap_or_default(),
+            endpoint: None,
+            engine_type: "vllm".to_string(),
+            modelname: "test-model".to_string(),
+            block_size: 4,
+            dp_rank,
+            store_backend: store_backend.to_string(),
+            replay_endpoint: None,
+            tenant_id: "default".to_string(),
+        }
+    }
+
+    fn unregister_request(instance_id: &str, dp_rank: u32) -> UnregisterRequest {
+        UnregisterRequest {
+            instance_id: instance_id.to_string(),
+            engine_type: "vllm".to_string(),
+            modelname: "test-model".to_string(),
+            block_size: 4,
+            dp_rank,
+            tenant_id: "default".to_string(),
+        }
+    }
+
+    fn seed_worker(
+        registry: &WorkerRegistry,
+        instance_id: &str,
+        dp_rank: u32,
+        medium: StorageMedium,
+        tokens_hash: u64,
+    ) {
+        let entry = registry.indexer.get_or_create("test-model", "default");
+        let worker = WorkerKey {
+            instance_id: instance_id.to_string(),
+            backend_id: instance_id.to_string(),
+            dp_rank,
+            medium,
+        };
+        entry
+            .apply_event(
+                &worker,
+                &KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: 1000 + u64::from(dp_rank),
+                        tokens_hash,
+                    }],
+                }),
+            )
+            .unwrap();
+    }
+
+    async fn reported_npu_blocks(
+        registry: &WorkerRegistry,
+        instance_id: &str,
+        dp_rank: u32,
+        tokens_hash: u64,
+    ) -> u32 {
+        registry
+            .query_by_hash(&QueryByHashRequest {
+                model: "test-model".to_string(),
+                block_size: 4,
+                block_hashes: vec![tokens_hash],
+                tenant_id: "default".to_string(),
+            })
+            .await
+            .unwrap()
+            .tenants
+            .get("default")
+            .and_then(|instances| instances.get(instance_id))
+            .and_then(|instance| instance.dp.get(&dp_rank.to_string()))
+            .map(|dp| dp.npu_blocks)
+            .unwrap_or(0)
+    }
 
     #[tokio::test]
     async fn test_node_pool_replay_without_backend_id_clears_node_dps() {
@@ -789,5 +1094,455 @@ mod tests {
         assert_eq!(extract_ip_from_endpoint("invalid"), None);
         assert_eq!(extract_ip_from_endpoint("tcp://"), None);
         assert_eq!(extract_ip_from_endpoint("tcp://[:5557"), None);
+    }
+
+    #[tokio::test]
+    async fn test_1000_identical_reregistrations_keep_one_tuple_and_ip_mapping() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let request = register_request("prefill-0", 0, Some("10.0.0.1"), "Mooncake");
+
+        for _ in 0..1000 {
+            registry.register(&request).await.unwrap();
+        }
+
+        let workers = registry.list_workers().await;
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].endpoints.len(), 1);
+        assert_eq!(
+            registry.hbm_ip_index.read().get("10.0.0.1"),
+            Some(&vec![("prefill-0".to_string(), 0)])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_dp_npu_provenance_is_server_owned_per_tuple() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let direct = register_request("prefill", 0, Some("10.0.0.1"), "Mooncake");
+        let mut ip_only_pool = register_request("mooncake-pool", 0, None, "Mooncake");
+        ip_only_pool.endpoint = Some("tcp://pool:5557".to_string());
+        registry.register(&direct).await.unwrap();
+        registry.register(&ip_only_pool).await.unwrap();
+
+        let workers = registry.list_workers().await;
+        let direct = workers
+            .iter()
+            .find(|worker| worker.instance_id == "prefill")
+            .unwrap();
+        let pool = workers
+            .iter()
+            .find(|worker| worker.instance_id == "mooncake-pool")
+            .unwrap();
+
+        assert!(direct.endpoints[&0].exact_dp_npu_provenance);
+        assert!(!pool.endpoints[&0].exact_dp_npu_provenance);
+    }
+
+    #[tokio::test]
+    async fn test_sparse_zero_query_and_provenance_annotation() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        registry
+            .register(&register_request(
+                "prefill",
+                0,
+                Some("10.0.0.1"),
+                "Mooncake",
+            ))
+            .await
+            .unwrap();
+
+        let empty = registry
+            .query_by_hash(&QueryByHashRequest {
+                model: "test-model".to_string(),
+                block_size: 4,
+                block_hashes: vec![123],
+                tenant_id: "default".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(empty.tenants["default"].is_empty());
+
+        seed_worker(&registry, "prefill", 0, StorageMedium::Npu, 123);
+        let hit = registry
+            .query_by_hash(&QueryByHashRequest {
+                model: "test-model".to_string(),
+                block_size: 4,
+                block_hashes: vec![123],
+                tenant_id: "default".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(hit.tenants["default"]["prefill"].dp["0"].exact_dp_npu_provenance);
+    }
+
+    #[tokio::test]
+    async fn test_http_npu_event_taints_exact_dp_provenance() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        registry
+            .register(&register_request(
+                "prefill",
+                0,
+                Some("10.0.0.1"),
+                "Mooncake",
+            ))
+            .await
+            .unwrap();
+
+        let event = KvCacheEvent {
+            event_id: 1,
+            data: KvEventWirePayload {
+                event_type: "stored".to_string(),
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash: 99,
+                    tokens_hash: 123,
+                }],
+                medium: Some("npu".to_string()),
+                ..Default::default()
+            },
+            dp_rank: 0,
+        };
+        registry
+            .apply_events("prefill", 0, &[event], None, None)
+            .await
+            .unwrap();
+
+        assert!(!registry.list_workers().await[0].endpoints[&0].exact_dp_npu_provenance);
+        let response = registry
+            .query_by_hash(&QueryByHashRequest {
+                model: "test-model".to_string(),
+                block_size: 4,
+                block_hashes: vec![123],
+                tenant_id: "default".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(!response.tenants["default"]["prefill"].dp["0"].exact_dp_npu_provenance);
+    }
+
+    #[tokio::test]
+    async fn test_unregistered_http_events_cannot_seed_exact_dp_state() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let event = KvCacheEvent {
+            event_id: 1,
+            data: KvEventWirePayload {
+                event_type: "stored".to_string(),
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash: 99,
+                    tokens_hash: 123,
+                }],
+                ..Default::default()
+            },
+            dp_rank: 0,
+        };
+
+        let error = registry
+            .apply_events("prefill", 0, &[event], Some("test-model"), None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, KvConductorError::InstanceNotFound { .. }));
+        assert!(registry.indexer.get("test-model", "default").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_events_require_the_registered_dp_rank() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        registry
+            .register(&register_request(
+                "prefill",
+                0,
+                Some("10.0.0.1"),
+                "Mooncake",
+            ))
+            .await
+            .unwrap();
+        let event = KvCacheEvent {
+            event_id: 1,
+            data: KvEventWirePayload {
+                event_type: "stored".to_string(),
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash: 99,
+                    tokens_hash: 123,
+                }],
+                ..Default::default()
+            },
+            dp_rank: 1,
+        };
+
+        let error = registry
+            .apply_events("prefill", 1, &[event], Some("test-model"), None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, KvConductorError::InstanceNotFound { .. }));
+        assert!(registry
+            .indexer
+            .get("test-model", "default")
+            .unwrap()
+            .worker_keys()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_live_and_replay_match_context_is_exact_for_engine_and_ip_only_for_pool() {
+        let (engine_mode, engine_uses_ip_index) = subscriber_match(false);
+        assert_eq!(engine_mode, MatchMode::None);
+        assert!(!engine_uses_ip_index);
+
+        let (pool_mode, pool_uses_ip_index) = subscriber_match(true);
+        assert_eq!(pool_mode, MatchMode::IpOnly);
+        assert!(pool_uses_ip_index);
+    }
+
+    #[tokio::test]
+    async fn test_reregister_clears_only_exact_dp_hbm() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let dp0 = register_request("prefill", 0, Some("10.0.0.1"), "Mooncake");
+        let dp1 = register_request("prefill", 1, Some("10.0.0.1"), "Mooncake");
+        registry.register(&dp0).await.unwrap();
+        registry.register(&dp1).await.unwrap();
+        seed_worker(&registry, "prefill", 0, StorageMedium::Npu, 900);
+        seed_worker(&registry, "prefill", 1, StorageMedium::Npu, 900);
+
+        registry.register(&dp0).await.unwrap();
+
+        assert_eq!(reported_npu_blocks(&registry, "prefill", 0, 900).await, 0);
+        assert_eq!(reported_npu_blocks(&registry, "prefill", 1, 900).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_backend_change_is_scoped_to_exact_dp() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let mut dp0 = register_request("prefill", 0, Some("10.0.0.1"), "Mooncake");
+        let dp1 = register_request("prefill", 1, Some("10.0.0.1"), "Mooncake");
+        registry.register(&dp0).await.unwrap();
+        registry.register(&dp1).await.unwrap();
+        seed_worker(&registry, "prefill", 1, StorageMedium::Cpu, 901);
+
+        dp0.store_backend = "YuanRong".to_string();
+        registry.register(&dp0).await.unwrap();
+        registry.register(&dp1).await.unwrap();
+
+        let entry = registry.indexer.get("test-model", "default").unwrap();
+        assert!(entry.worker_keys().iter().any(|worker| {
+            worker.instance_id == "prefill"
+                && worker.dp_rank == 1
+                && worker.medium == StorageMedium::Cpu
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_identity_conflict_is_typed_and_state_is_unchanged() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let request = register_request("prefill", 0, Some("10.0.0.1"), "Mooncake");
+        registry.register(&request).await.unwrap();
+        seed_worker(&registry, "prefill", 0, StorageMedium::Npu, 902);
+
+        let mut model_conflict = request.clone();
+        model_conflict.modelname = "other-model".to_string();
+        model_conflict
+            .medium_endpoints
+            .insert("npu".to_string(), "tcp://10.0.0.2:50090".to_string());
+        let mut tenant_conflict = request.clone();
+        tenant_conflict.tenant_id = "other-tenant".to_string();
+        let mut block_size_conflict = request.clone();
+        block_size_conflict.block_size = 256;
+
+        for conflict in [model_conflict, tenant_conflict, block_size_conflict] {
+            let error = registry.register(&conflict).await.unwrap_err();
+            assert!(matches!(
+                error,
+                KvConductorError::RegistrationIdentityConflict { .. }
+            ));
+        }
+        assert_eq!(registry.list_workers().await[0].model_name, "test-model");
+        assert_eq!(
+            registry.hbm_ip_index.read().get("10.0.0.1"),
+            Some(&vec![("prefill".to_string(), 0)])
+        );
+        assert!(!registry.hbm_ip_index.read().contains_key("10.0.0.2"));
+        assert_eq!(reported_npu_blocks(&registry, "prefill", 0, 902).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_unknown_tuple_is_noop_and_releases_lifecycle_lock() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        registry
+            .register(&register_request(
+                "prefill",
+                0,
+                Some("10.0.0.1"),
+                "Mooncake",
+            ))
+            .await
+            .unwrap();
+        let before_ip_index = registry.hbm_ip_index.read().clone();
+
+        let error = registry
+            .unregister(&unregister_request("unknown", 7))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, KvConductorError::InstanceNotFound { .. }));
+        let workers = registry.list_workers().await;
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].instance_id, "prefill");
+        assert!(workers[0].endpoints.contains_key(&0));
+        assert_eq!(*registry.hbm_ip_index.read(), before_ip_index);
+        assert!(!registry.lifecycle_locks.contains_key("unknown"));
+    }
+
+    #[tokio::test]
+    async fn test_10000_randomized_registry_lifecycle_events_match_reference_state() {
+        let registry = WorkerRegistry::without_subscriber_connections();
+        let mut active: HashMap<(String, u32), String> = HashMap::new();
+        let mut random = 0xCFF8_7175_D15C_A11Eu64;
+
+        for _ in 0..10_000 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let instance_id = format!("prefill-{}", (random >> 8) % 8);
+            let dp_rank = ((random >> 16) % 4) as u32;
+            let key = (instance_id.clone(), dp_rank);
+
+            if random.is_multiple_of(4) {
+                let result = registry
+                    .unregister(&unregister_request(&instance_id, dp_rank))
+                    .await;
+                if active.remove(&key).is_some() {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(KvConductorError::InstanceNotFound { .. })
+                    ));
+                }
+            } else {
+                let ip = format!("10.0.{}.{}", (random >> 24) % 4, (random >> 32) % 8 + 1);
+                registry
+                    .register(&register_request(
+                        &instance_id,
+                        dp_rank,
+                        Some(&ip),
+                        "Mooncake",
+                    ))
+                    .await
+                    .unwrap();
+                active.insert(key, ip);
+            }
+
+            let actual_tuples: HashSet<(String, u32)> = registry
+                .list_workers()
+                .await
+                .into_iter()
+                .flat_map(|worker| {
+                    worker
+                        .endpoints
+                        .into_keys()
+                        .map(move |dp| (worker.instance_id.clone(), dp))
+                })
+                .collect();
+            assert_eq!(actual_tuples, active.keys().cloned().collect());
+
+            let mut expected_ip_index: HashMap<String, HashSet<(String, u32)>> = HashMap::new();
+            for (worker, ip) in &active {
+                expected_ip_index
+                    .entry(ip.clone())
+                    .or_default()
+                    .insert(worker.clone());
+            }
+            let actual_ip_index = registry.hbm_ip_index.read();
+            assert_eq!(actual_ip_index.len(), expected_ip_index.len());
+            for (ip, workers) in actual_ip_index.iter() {
+                let unique: HashSet<(String, u32)> = workers.iter().cloned().collect();
+                assert_eq!(
+                    unique.len(),
+                    workers.len(),
+                    "duplicate IP index entry for {ip}"
+                );
+                assert_eq!(Some(&unique), expected_ip_index.get(ip));
+            }
+        }
+
+        let remaining: Vec<(String, u32)> = active.into_keys().collect();
+        for (instance_id, dp_rank) in remaining {
+            registry
+                .unregister(&unregister_request(&instance_id, dp_rank))
+                .await
+                .unwrap();
+        }
+        assert!(registry.list_workers().await.is_empty());
+        assert!(registry.hbm_ip_index.read().is_empty());
+        assert!(registry.indexer_summary().is_empty());
+        assert!(registry.lifecycle_locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unrelated_registration_is_not_blocked_by_subscriber_shutdown() {
+        let registry = Arc::new(WorkerRegistry::without_subscriber_connections());
+        registry
+            .register(&register_request("blocked", 0, None, "Mooncake"))
+            .await
+            .unwrap();
+        let (subscriber, cancel, stopped) =
+            crate::zmq_subscriber::ZmqSubscriber::pending_for_test();
+        registry.zmq_subscribers.write().await.insert(
+            ("blocked".to_string(), 0, "test://pending".to_string()),
+            subscriber,
+        );
+
+        let blocked_registry = Arc::clone(&registry);
+        let unregister = tokio::spawn(async move {
+            blocked_registry
+                .unregister(&unregister_request("blocked", 0))
+                .await
+        });
+        cancel.cancelled().await;
+
+        let unrelated = tokio::time::timeout(
+            Duration::from_millis(100),
+            registry.register(&register_request("unrelated", 0, None, "Mooncake")),
+        )
+        .await;
+        stopped.store(true, Ordering::Release);
+        unregister.await.unwrap().unwrap();
+
+        assert!(
+            matches!(unrelated, Ok(Ok(()))),
+            "unrelated registration waited for another worker's shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replay_does_not_hold_instances_write_lock() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                let _ = accepted_tx.send(());
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        let registry = Arc::new(WorkerRegistry::without_subscriber_connections());
+        let mut request = register_request("replay", 0, Some("10.0.0.1"), "Mooncake");
+        request.replay_endpoint = Some(format!("tcp://127.0.0.1:{port}"));
+        let registration_registry = Arc::clone(&registry);
+        let registration =
+            tokio::spawn(async move { registration_registry.register(&request).await });
+
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("replay did not connect")
+            .expect("replay accept signal dropped");
+
+        let workers =
+            tokio::time::timeout(Duration::from_millis(200), registry.list_workers()).await;
+        assert!(
+            workers.is_ok(),
+            "list_workers waited for replay while holding the global instances lock"
+        );
+        registration.await.unwrap().unwrap();
     }
 }

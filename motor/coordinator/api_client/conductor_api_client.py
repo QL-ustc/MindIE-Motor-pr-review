@@ -19,6 +19,7 @@ from motor.common.http.http_client import SafeHTTPSClient
 from motor.common.utils.env import Env
 from motor.common.utils.net import format_address, format_host
 from motor.config.coordinator import CoordinatorConfig
+from motor.coordinator.api_client.conductor_evidence import ConductorSchemaError, parse_registered_workers
 
 
 TENANT_ID = "default"
@@ -112,6 +113,22 @@ class ConductorApiClient:
         return "per_node"
 
     @classmethod
+    def _resolve_runtime_model(cls, instances: list[Instance], *, eligible_only: bool = True) -> str | None:
+        """Return the single runtime model shared by this Conductor namespace."""
+        candidates = [instance for instance in instances if not eligible_only or instance.role in _KVA_ROLES]
+        model_values = [instance.model_name for instance in candidates]
+        models = {model for model in model_values if isinstance(model, str) and model}
+        if not candidates:
+            return None
+        if len(models) != 1 or not all(isinstance(model, str) and model for model in model_values):
+            logger.error(
+                "Conductor supports one runtime model per Coordinator; refusing namespace models=%s",
+                sorted(models),
+            )
+            return None
+        return next(iter(models))
+
+    @classmethod
     def register_kv_instance(cls, instances: list[Instance]) -> None:
         """Register all KVA-eligible instance endpoints with the KV conductor."""
         reg = cls._kv_reg()
@@ -123,7 +140,10 @@ class ConductorApiClient:
         sb = cls._resolve_store_backend()
 
         if mode == "pool":
-            cls._register_pool(reg, sb)
+            model_name = cls._resolve_runtime_model(instances)
+            if model_name is None:
+                return
+            cls._register_pool(reg, sb, model_name)
         for instance in instances:
             if instance.role not in _KVA_ROLES:
                 continue
@@ -175,7 +195,7 @@ class ConductorApiClient:
         return pattern.replace("*", format_host(host))
 
     @classmethod
-    def _register_pool(cls, reg, store_backend: str) -> None:
+    def _register_pool(cls, reg, store_backend: str, model_name: str) -> None:
         """Register the centralized pool once per cluster (domain name)."""
         if cls._pool_registered:
             return
@@ -189,7 +209,7 @@ class ConductorApiClient:
             "endpoint": endpoint,
             "type": reg.engine_type,
             "store_backend": store_backend,
-            "modelname": reg.model_path or "default",
+            "modelname": model_name,
             "block_size": reg.block_size,
             "dp_rank": 0,
         }
@@ -675,6 +695,10 @@ class ConductorApiClient:
         Circuit breaker: after ``_QUERY_CB_THRESHOLD`` consecutive failures,
         skip queries for ``_QUERY_CB_COOLDOWN`` seconds.
         """
+        model_name = cls._resolve_runtime_model(instances, eligible_only=False)
+        if model_name is None:
+            return {}
+
         # ── Circuit open? ──────────────────────────────────────────
         if cls._query_failures >= cls._QUERY_CB_THRESHOLD:
             if time.time() < cls._query_cool_until:
@@ -692,7 +716,7 @@ class ConductorApiClient:
 
         reg = cls._kv_reg()
         query_data: dict = {
-            "model": instances[0].model_name,
+            "model": model_name,
             "block_size": reg.block_size,
             "token_ids": encoded_ids,
         }
@@ -791,49 +815,23 @@ class ConductorApiClient:
 
     @classmethod
     def get_registered_services(cls) -> list[dict[str, Any]]:
-        """Get registered services from the conductor.
+        """Get the current lowercase ``GET /workers`` registration schema.
 
-        Tries both API flavours so the same code works with:
-        - kv-conductor: ``GET /workers`` → ``{"workers": [...]}``
-        - Mooncake Master: ``GET /services`` → ``{"services": [...]}``
+        A legacy or mixed response raises ``ConductorSchemaError`` so a
+        caller cannot mistake an incompatible control plane for an empty
+        registration set and mutate it speculatively.
         """
         reg = cls._kv_reg()
         client_args = {"address": format_address(reg.conductor_service, reg.http_server_port)}
 
         with SafeHTTPSClient(timeout=15, **client_args) as client:
-            # ── kv-conductor flavour (preferred) ─────────────────────
-            try:
-                response = client.get("/workers")
-            except Exception:
-                response = None
-            if isinstance(response, dict):
-                workers = response.get("workers")
-                if isinstance(workers, list) and workers:
-                    return workers
-
-            # ── Mooncake Master flavour (fallback) ───────────────────
-            try:
-                response = client.get("/services")
-            except Exception:
-                response = None
-            if isinstance(response, dict):
-                services = response.get("services", [])
-                if isinstance(services, list):
-                    return services
-
-        return []
+            response = client.get("/workers")
+        workers, _registered = parse_registered_workers(response)
+        return workers
 
     @staticmethod
     def _normalize_service_key(service: dict[str, Any]) -> set[tuple[str, int]]:
-        """Extract (instance_id, dp_rank) pairs from a service entry.
-
-        Handles both response formats:
-
-        - kv-conductor ``WorkerSummary``:
-          ``{"instance_id": "...", "endpoints": {"0": {...}, "1": {...}}}``
-        - Mooncake Master service entry:
-          ``{"InstanceID": "...", "DPRank": 0, ...}``
-        """
+        """Extract lowercase ``WorkerSummary`` tuple keys only."""
         keys: set[tuple[str, int]] = set()
 
         # ── kv-conductor format: nested endpoints HashMap ────────────
@@ -848,19 +846,6 @@ class ConductorApiClient:
                 keys.add((instance_id, dp_rank))
             if keys:
                 return keys
-
-        # ── Mooncake Master format: flat fields ──────────────────────
-        instance_id = service.get("InstanceID", "")
-        if instance_id:
-            dp_raw = service.get("DPRank", -1)
-            if isinstance(dp_raw, int):
-                dp_rank = dp_raw
-            else:
-                try:
-                    dp_rank = int(dp_raw)
-                except (ValueError, TypeError):
-                    dp_rank = -1
-            keys.add((instance_id, dp_rank))
 
         return keys
 
@@ -891,30 +876,72 @@ class ConductorApiClient:
     def re_register_kv_instances(cls, instances: list[Instance]) -> None:
         """Re-register any KVA-eligible instances that are missing from the conductor.
 
-        Compares the set of locally known (instance_id, dp_rank) pairs against
-        those already registered on the conductor (via GET /workers).  Missing
-        entries are re-registered with :meth:`register_post`.
+        Compares the complete local namespace and tuple set against strict
+        ``GET /workers`` evidence. Missing entries are rebuilt through the
+        active backend-specific registration path; unavailable or conflicting
+        evidence causes no mutation.
         """
         logger.info("re_register_kv_instances started.")
+        reg = cls._kv_reg()
+        store_backend = cls._resolve_store_backend()
+        mode = cls._resolve_backend_mode()
+        model_name = cls._resolve_runtime_model(instances) if mode == "pool" else None
+        if mode == "pool" and model_name is None:
+            return
         try:
             registered_services = cls.get_registered_services()
-        except Exception:
-            logger.info("no registered services found in conductor, skipping re-register.")
+            _workers, registered = parse_registered_workers({"workers": registered_services})
+        except ConductorSchemaError as error:
+            logger.error(
+                "Conductor registration schema is incompatible; refusing reconciliation endpoint=%s:%s: %s",
+                reg.conductor_service,
+                reg.http_server_port,
+                error,
+            )
+            return
+        except Exception as error:
+            logger.warning("Conductor registration evidence unavailable; skipping reconciliation: %s", error)
             return
 
-        # Collect all (instance_id, dp_rank) already registered on the conductor.
-        registered_dps: set[tuple[str, int]] = set()
-        for worker in registered_services:
-            if isinstance(worker, dict):
-                registered_dps |= cls._normalize_service_key(worker)
+        registered_dps = set(registered)
+        expected_namespaces = {
+            conductor_instance_id(instance): (instance.model_name, TENANT_ID, reg.block_size)
+            for instance in instances
+            if instance.role in _KVA_ROLES
+        }
+        pool_key: tuple[str, int] | None = None
+        if mode == "pool" and cls._resolve_pool_endpoint(reg.pool_endpoint):
+            pool_key = (f"{store_backend.lower()}-pool", 0)
+            expected_namespaces[pool_key[0]] = (model_name, TENANT_ID, reg.block_size)
+
+        # Any existing tuple under one of our identities must agree on the
+        # complete namespace. A conflict is not repaired by overwriting it.
+        for registration in registered.values():
+            expected_namespace = expected_namespaces.get(registration.instance_id)
+            if expected_namespace is None:
+                continue
+            if (registration.model_name, registration.tenant_id, registration.block_size) != expected_namespace:
+                logger.error(
+                    "Conductor namespace conflict; refusing reconciliation instance=%s dp_rank=%s",
+                    registration.instance_id,
+                    registration.dp_rank,
+                )
+                return
+
+        if pool_key is not None:
+            if pool_key in registered:
+                cls._pool_registered = True
+            else:
+                # The process-local latch cannot prove the remote Conductor
+                # survived. A valid /workers miss forces a cold rebuild.
+                cls._pool_registered = False
+                cls._register_pool(reg, store_backend, model_name)
 
         # Node pools are per node, not per DP, so they are invisible to the
         # (instance_id, dp_rank) comparison below — re-sync the local cache with
         # what the conductor really holds before deciding what to re-register.
-        mode = cls._resolve_backend_mode()
-        sb = cls._resolve_store_backend()
         if mode == "per_node":
-            cls._resync_yuanrong_nodes(sb, registered_dps)
+            cls._resync_yuanrong_nodes(store_backend, registered_dps)
 
         for instance in instances:
             if instance.role not in _KVA_ROLES:
@@ -922,6 +949,24 @@ class ConductorApiClient:
             for ep, dp_rank in cls._hbm_event_targets(instance):
                 payload = cls._build_register_payload(instance, ep, dp_rank)
                 if not payload:
+                    if not any(
+                        (
+                            reg.npu_endpoint,
+                            reg.xpu_endpoint,
+                            reg.endpoint,
+                            reg.cpu_endpoint,
+                            reg.disk_endpoint,
+                        )
+                    ):
+                        logger.info(
+                            "HTTP-only service missing in conductor, re-registering instance=%s dp_rank=%s",
+                            conductor_instance_id(instance),
+                            dp_rank,
+                        )
+                        cls._register_hbm_dp(reg, store_backend, instance, ep, dp_rank)
+                        if mode == "per_node":
+                            cls._register_yuanrong_node(reg, store_backend, instance, ep, dp_rank)
+                        continue
                     logger.debug(
                         "skip re-register because payload build failed for instance=%s endpoint=%s dp=%s",
                         instance.id,
@@ -948,7 +993,7 @@ class ConductorApiClient:
                         ep.ip,
                         instance.model_name,
                     )
-                    cls._register_yuanrong_node(cls._kv_reg(), sb, instance, ep, dp_rank)
+                    cls._register_yuanrong_node(cls._kv_reg(), store_backend, instance, ep, dp_rank)
                     continue
 
                 logger.info(

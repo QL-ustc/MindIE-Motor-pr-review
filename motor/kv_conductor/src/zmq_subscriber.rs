@@ -116,6 +116,20 @@ impl ZmqSubscriber {
         Ok(Self { cancel, stopped })
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_for_test() -> (Self, CancellationToken, Arc<AtomicBool>) {
+        let cancel = CancellationToken::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                cancel: cancel.clone(),
+                stopped: Arc::clone(&stopped),
+            },
+            cancel,
+            stopped,
+        )
+    }
+
     /// Cancel the subscriber and wait for its background task to exit.
     ///
     /// Sets the cancellation token, then polls `stopped` until the
@@ -262,12 +276,14 @@ fn subscriber_loop(
     let mut batch_count: u64 = 0;
     let mut event_count: u64 = 0;
     let mut parse_errors: u64 = 0;
+    let mut skipped_exact_dp: u64 = 0;
 
     loop {
         if cancel.is_cancelled() {
             tracing::info!(
                 %backend_id, dp_rank,
                 batches = batch_count, events = event_count, parse_errors,
+                skipped_exact_dp,
                 "ZMQ subscriber shutting down"
             );
             break;
@@ -313,6 +329,7 @@ fn subscriber_loop(
             &mut batch_count,
             &mut event_count,
             &mut parse_errors,
+            &mut skipped_exact_dp,
         );
     }
 }
@@ -334,6 +351,7 @@ fn process_payload(
     batch_count: &mut u64,
     event_count: &mut u64,
     parse_errors: &mut u64,
+    skipped_exact_dp: &mut u64,
 ) {
     let payload_bytes: &[u8] = payload_msg;
 
@@ -388,7 +406,7 @@ fn process_payload(
                     medium = %zmq_event.medium.as_deref().unwrap_or(""),
                     "kv_event event_parsed backend=memcache"
                 );
-                if let Err(e) = events::apply_pool_event(
+                match events::apply_pool_event(
                     indexer,
                     zmq_event,
                     model_name,
@@ -399,8 +417,12 @@ fn process_payload(
                     match_mode,
                     hbm_ip_index,
                 ) {
-                    *parse_errors += 1;
-                    tracing::warn!(%backend_id, dp_rank, event_id = zmq_event.event_id, "{e}");
+                    Ok(events::PoolEventOutcome::SkippedExactDp) => *skipped_exact_dp += 1,
+                    Ok(events::PoolEventOutcome::Applied) => {}
+                    Err(e) => {
+                        *parse_errors += 1;
+                        tracing::warn!(%backend_id, dp_rank, event_id = zmq_event.event_id, "{e}");
+                    }
                 }
             }
         } else {
@@ -451,7 +473,7 @@ fn process_payload(
             );
             for zmq_event in &events_vec {
                 *event_count += 1;
-                if let Err(e) = events::apply_pool_event(
+                match events::apply_pool_event(
                     indexer,
                     zmq_event,
                     model_name,
@@ -462,8 +484,12 @@ fn process_payload(
                     match_mode,
                     hbm_ip_index,
                 ) {
-                    *parse_errors += 1;
-                    tracing::warn!(%backend_id, dp_rank, event_id = zmq_event.event_id, "{e}");
+                    Ok(events::PoolEventOutcome::SkippedExactDp) => *skipped_exact_dp += 1,
+                    Ok(events::PoolEventOutcome::Applied) => {}
+                    Err(e) => {
+                        *parse_errors += 1;
+                        tracing::warn!(%backend_id, dp_rank, event_id = zmq_event.event_id, "{e}");
+                    }
                 }
             }
         }
@@ -677,8 +703,8 @@ pub fn replay_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{event_source_for_media, EventSource};
-    use crate::protocols::StorageMedium;
+    use super::*;
+    use crate::protocols::{HbmIpIndex, StorageMedium};
 
     #[test]
     fn cpu_and_disk_subscribers_use_pool_wire_format() {
@@ -694,5 +720,53 @@ mod tests {
             event_source_for_media(&[StorageMedium::Npu]),
             EventSource::Engine
         );
+    }
+
+    #[test]
+    fn ip_only_npu_pool_event_increments_skip_counter_not_parse_errors() {
+        let payload = rmp_serde::to_vec(&rmpv::Value::Map(vec![(
+            rmpv::Value::from("events"),
+            rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                (rmpv::Value::from("event_type"), rmpv::Value::from("stored")),
+                (rmpv::Value::from("medium"), rmpv::Value::from("xpu")),
+                (
+                    rmpv::Value::from("backend_id"),
+                    rmpv::Value::from("10.0.0.1"),
+                ),
+                (
+                    rmpv::Value::from("seq_hashes"),
+                    rmpv::Value::Array(vec![rmpv::Value::from(1u64)]),
+                ),
+            ])]),
+        )]))
+        .unwrap();
+        let indexer = crate::indexer::Indexer::new();
+        let mut batch_count = 0;
+        let mut event_count = 0;
+        let mut parse_errors = 0;
+        let mut skipped_exact_dp = 0;
+
+        process_payload(
+            &payload,
+            &indexer,
+            "model",
+            "default",
+            "memcache-pool",
+            4,
+            0,
+            &[StorageMedium::Npu, StorageMedium::Cpu, StorageMedium::Disk],
+            EventSource::Pool,
+            MatchMode::IpOnly,
+            &Some(HbmIpIndex::default()),
+            &mut batch_count,
+            &mut event_count,
+            &mut parse_errors,
+            &mut skipped_exact_dp,
+        );
+
+        assert_eq!(batch_count, 1);
+        assert_eq!(event_count, 1);
+        assert_eq!(parse_errors, 0);
+        assert_eq!(skipped_exact_dp, 1);
     }
 }

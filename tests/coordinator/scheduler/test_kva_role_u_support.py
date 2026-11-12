@@ -27,6 +27,7 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
 def _build_instance(role: PDRole) -> Mock:
     instance = Mock()
     instance.role = role
+    instance.model_name = "qwen3-8B"
     endpoint = Mock()
     instance.endpoints = {"pod-0": {0: endpoint}}
     instance.get_all_endpoints.return_value = (endpoint,)

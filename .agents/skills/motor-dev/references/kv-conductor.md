@@ -38,7 +38,7 @@ Coordinator owns registration and selection, while the engine owns cached KV dat
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/register` | POST | Register a worker instance (HBM or pool) |
+| `/register` | POST | Register a worker `(instance_id, dp_rank)` (HBM or pool); incompatible namespace reuse returns HTTP 409 |
 | `/unregister` | POST | Remove worker; cleans up radix-tree blocks |
 | `/query` | POST | Query KV cache overlap scores for token sequence |
 | `/query_by_hash` | POST | Query using pre-computed `LocalBlockHash` values |
@@ -57,9 +57,13 @@ Body fields:
 
 - `instance_id` (required) — the worker the events originate from
 - `model_name`, `tenant_id` (optional) — fall back to the registered values when omitted
-- `block_size` (optional) — falls back to the registered value, then to the default `128`
+- `block_size` (optional) — wire-compatibility field; HTTP ingestion does not consume it
 - `events` — list of `KvCacheEvent`
 - `shutdown` (optional bool) — shutdown flag for the instance
+
+The `(instance_id, dp_rank)` tuple must already be registered. HTTP events are
+not allowed to seed an indexer entry before registration; an unknown tuple
+returns HTTP 404 and leaves the indexer unchanged.
 
 Each `KvCacheEvent` accepts two JSON shapes via serde aliases:
 
@@ -77,7 +81,7 @@ Crate root: `motor/kv_conductor/` (paths below are relative to it).
 | `src/main.rs` | CLI: host/port, maintenance interval and TTLs; tracing (UTC+8), axum serve |
 | `src/lib.rs` | Module declarations + re-exports |
 | `src/server.rs` | HTTP routes, `AppState { registry }`, middleware, JSON/msgpack content negotiation on query endpoints |
-| `src/registry.rs` | WorkerRegistry: register/unregister/query dispatch, ZMQ lifecycle, re-registration, replay gating |
+| `src/registry.rs` | WorkerRegistry: exact-DP register/unregister/query dispatch, idempotent ZMQ/IP-index lifecycle, re-registration, replay gating |
 | `src/indexer/` | Indexer (DashMap), IndexerEntry (hbm_tree + cpu/disk continuation index + offload cache), query, two-phase matching (`mod.rs`, `tests.rs`) |
 | `src/lower_tier.rs` | `LowerTierIndexer` continuation-edge graph; breakpoint resume + unfiltered root walk |
 | `src/concurrent_tree.rs` | ConcurrentRadixTree (`Arc<RwLock<Block>>`), find_matches/apply_store/remove_worker |
@@ -92,7 +96,7 @@ Crate root: `motor/kv_conductor/` (paths below are relative to it).
 | `src/protocols.rs` | HTTP types, WorkerKey, StorageMedium, KvCacheEventData, query/response types |
 | `src/hashing.rs` | `compute_block_hash_for_seq()` — XXH3 with rayon parallel |
 | `src/error.rs` | KvConductorError (thiserror) |
-| `tests/integration_test.rs` | HTTP API integration tests over an axum test server |
+| `tests/integration_test.rs` | HTTP API integration tests (axum test server, JSON/msgpack) |
 
 ---
 
@@ -235,7 +239,7 @@ registered medium and is included in the subscriber startup log.
 
 **Key difference from pool events:** vLLM events carry `token_ids` — the actual token values. This allows the conductor to **recompute** `LocalBlockHash` via XXH3, enabling proper radix tree insertion.
 
-**Parsed event structure (`VllmEventMap`):**
+**Supported `BlockStored` wire structures (`VllmEventMap`):**
 
 ``` json
 {"type": "BlockStored", "block_hashes": [100], "parent_block_hash": null, "token_ids": [1, 2], "block_size": 2, "medium": "GPU"}
@@ -244,7 +248,25 @@ registered medium and is included in the subscriber startup log.
 Map fields are decoded by name with typed serde parsing and `FlexHash` hash decoding.
 Optional fields may be omitted or null; unknown fields (including `extra_keys`) are ignored.
 `type` is required. `BlockRemoved` and `AllBlocksCleared` use the same map decoder.
-Legacy arrays use `rmpv::Value` + tag-based dispatch + type-pattern parsing.
+
+Legacy tagged arrays remain supported (`rmpv::Value` + tag-based dispatch +
+type-pattern parsing), including the vLLM 0.23 fixed-position layout below:
+
+``` text
+["BlockStored", block_hashes, parent_hash_or_nil, token_ids, block_size, lora_id_or_nil, medium_or_nil, lora_name_or_nil, extra_keys?, group_idx?, kv_cache_spec_kind?, kv_cache_spec_sliding_window?]
+```
+
+The first seven fields after the tag are vLLM 0.23's non-default fields. Their
+positions are fixed, so nullable values are encoded as explicit `nil`
+placeholders; `omit_defaults=True` can omit only trailing default-valued
+fields. The parser detects this fixed-position layout before the compact legacy
+layout, where null placeholders have no positional meaning.
+
+`BlockRemoved` similarly accepts the vLLM 0.23 fixed layout
+`["BlockRemoved", block_hashes, medium_or_nil, group_idx?]` as well as the
+compact legacy layout. Known events with malformed required fields or invalid
+fixed-position field types are rejected. Unknown event tags remain ignored for
+forward compatibility.
 
 **Attention-group filtering:** A deny-list excludes SlidingWindow, SlidingWindowMla, Mamba,
 ChunkedLocalAttention, EncoderOnlyAttention and CrossAttention (case/underscore insensitive).
@@ -413,22 +435,86 @@ port independently of `kv_events_port`; expanded single-HTTP DPs use the same ra
 events. Without an override, replay retains the configured base + rank. An empty replay pattern
 disables replay even when a port override is supplied.
 
-When a `/register` payload includes a `replay_endpoint` (and the instance is not already registered), the conductor starts a **ZMQ DEALER → ROUTER replay** session with the engine:
+When a `/register` payload includes a `replay_endpoint` for a newly registered
+`(instance_id, dp_rank)`, the conductor starts a **ZMQ DEALER → ROUTER replay**
+session with the engine:
 
 1. DEALER sends `[b"", start_seq: u64 BE]` (start_seq = 0)
 2. ROUTER replies `[b"", seq: u64 BE, msgpack_payload]` per buffered batch
 3. End-of-stream: `seq == u64::MAX` (0xFFFFFFFFFFFFFFFF)
 
-Replay runs synchronously in a `spawn_blocking` task (blocking ZMQ I/O off the tokio runtime). Registration resolves the routing identity, matching mode, and HBM IP index once for both live ingestion and replay: YuanRong node pools use the node IP extracted from their CPU/Disk endpoint, including when events omit `backend_id`; engine registrations retain their instance ID. Pool replay uses the live pool wire-format dispatcher, bypassing vLLM parsing so untagged pool maps cannot be swallowed as unknown engine events. Engine replay tries vLLM batches followed by the legacy pool batch fallback. If the same instance re-registers later (`instance_exists`), replay is skipped. Replay runs asynchronously relative to queries; there is no query readiness gate around it.
+Registration awaits the `spawn_blocking` replay task so replay remains ordered
+with lifecycle changes for that instance, while blocking ZMQ I/O stays off the
+tokio runtime. Registration resolves the routing identity, matching mode, and
+HBM IP index once for both live ingestion and replay: YuanRong node pools use
+the node IP extracted from their CPU/Disk endpoint, including when events omit
+`backend_id`; engine registrations retain their instance ID. Pool replay uses
+the live pool wire-format dispatcher, bypassing vLLM parsing so untagged pool
+maps cannot be swallowed as unknown engine events. Engine replay tries vLLM
+batches followed by the legacy pool batch fallback.
+
+Exact-tuple re-registration skips replay after conservatively invalidating old
+NPU state. The global `instances` write lock is narrowed to registration
+metadata mutation and released before replay; only the per-instance lifecycle
+lock remains held. This ordering does **not** prove a complete warm snapshot:
+queries are not gated during replay, and the protocol has no publisher
+generation, high-watermark, or gap-free snapshot contract. `/workers` therefore
+proves registration only, not cache readiness; warm-hit preservation requires a
+separate replay/provenance contract.
 
 ### Re-registration
 
-Re-registering an existing `(instance_id, dp_rank)` stops the old ZMQ subscribers and:
+Registry/cache ownership is keyed by `(instance_id, dp_rank)`. A per-instance
+lifecycle lock protects the shared immutable model/tenant/block-size namespace,
+but cache and subscriber mutations target only the requested DP. Re-registering
+an existing tuple stops its old ZMQ subscribers without holding the global
+subscriber-map lock across the awaited shutdown, removes stale IP-index entries,
+and deduplicates the replacement mapping.
 
-- If the backend type changed → drops the radix-tree / lower-tier data for the old registration (`remove_worker_all_media`) and clears its HBM IP index entries
-- If the backend is unchanged → preserves tree data and only updates endpoint info
+- Every re-registration clears that exact DP's old NPU state, including an
+  unchanged endpoint, because endpoint equality is not process-generation proof.
+- If the backend type changed, it clears all media for that exact DP.
+- CPU/Disk state is retained only for same-backend re-registration.
+- Reusing an instance ID with a different model, tenant, or block size returns a
+  typed identity conflict (HTTP 409); callers must explicitly unregister first.
+- Repeated identical registration is idempotent for registry and IP-index
+  cardinality.
 
-This lets clients fix misconfigured endpoints by simply re-registering, without a restart or explicit unregister.
+These guarantees concern registry lifecycle only. An `IpOnly` pool event still
+cannot prove exact-DP block placement.
+
+### Exact-DP scheduling evidence
+
+`EndpointInfo` and each non-sparse query tuple expose the server-owned boolean
+`exact_dp_npu_provenance`. It is true only for a direct registration whose NPU
+events arrive through a subscriber bound to that exact `(instance_id, dp_rank)`.
+It is false for HTTP-only and pool auto-attach registrations. If a registered
+tuple later ingests an HTTP NPU event, the capability is conservatively
+downgraded to false until re-registration.
+
+`MatchMode::IpOnly` pool/vLLM stored events may fan out by node IP and therefore
+must not write the exact-DP NPU tier. Pool events filter NPU for stored,
+removed, and cleared operations. An NPU-only pool event is an expected skip,
+counted separately from parse errors; multi-tier events continue with CPU/Disk
+processing. vLLM NPU-only writes are rejected. `IpOnly` remains usable as
+node-level pool placement evidence, but never as exact-DP NPU credit.
+
+A query against a registered model/tenant/block-size namespace with no matched
+blocks returns a valid sparse `{tenant: {}}` response. The strict Python
+evidence adapter combines that response with `/workers`: an expected registered
+tuple omitted from the query is a zero hit, while a missing registration,
+namespace mismatch, transport failure, or unknown/mixed schema makes the whole
+evidence set unavailable. `/workers` still proves registration only, not cache
+readiness or warm replay completeness.
+
+Rust's JSON and MessagePack query serializers also emit `npu_end`, `cpu_end`,
+and `disk_end`: absolute coverage metadata before exclusive tier partitioning.
+The Python evidence adapter accepts these fields as optional metadata for
+compatibility, validating each supplied value as a non-negative integer
+(excluding booleans). The four original count fields remain required. Coverage
+ends do not add cache credit: credit uses exclusive block counts and the
+registration/query provenance flags. Shared wire fixtures are checked against
+the Rust serializers and decoded by the Python adapter tests.
 
 Coordinator's periodic reconciliation defaults to off (`re_register_interval_sec=0`).
 When enabled, it re-registers missing P/U DPs and reconciles YuanRong node-pool caches against
@@ -569,7 +655,7 @@ Inline test modules co-located with their code:
 
 ### Integration Tests (`tests/integration_test.rs`)
 
-HTTP API tests over a real axum server on a random local port (`start_test_server()` helper binds `127.0.0.1:0`), exercising `/register`, `/unregister`, `/query`, `/query_by_hash` (msgpack), `/events`, `/health`, `/workers`. Note: `test_query_after_kv_events`'s event injection is a silent 422 in the original test (`_resp` is not asserted) — `register_and_seed()` in the msgpack tests fixes this by carrying `instance_id`; treat that helper as the canonical injection pattern. The msgpack tests assert Content-Type negotiation (`application/msgpack` request → msgpack response, errors included) and structural equality between msgpack and JSON query responses.
+HTTP API tests run over a real axum server on a random local port (`start_test_server()` helper binds `127.0.0.1:0`), exercising `/register`, `/unregister`, `/query`, `/query_by_hash` (msgpack), `/events`, `/health`, `/workers`. Event injection must include `instance_id`; tests assert the ingestion response before using its data as query evidence. Unregistered instance/DP event injection must return 404 without indexer mutation. The re-registration tests prove stale NPU invalidation, and the identity-conflict test proves HTTP 409 without metadata mutation. The msgpack tests assert Content-Type negotiation (`application/msgpack` request → msgpack response, errors included) and structural equality between msgpack and JSON query responses.
 
 ### Performance Profiling
 

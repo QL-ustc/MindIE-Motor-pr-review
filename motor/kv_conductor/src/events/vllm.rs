@@ -63,7 +63,19 @@ fn block_size_mismatch_warn_map() -> &'static BlockSizeMismatchWarnMap {
 
 /// A vLLM msgspec-tagged event, encoded as a map with a `type` field.
 /// The batch's `array_like=True` does not propagate to nested event structs.
-/// Legacy tagged arrays are also accepted, using type + order matching.
+///
+/// Legacy tagged arrays are also accepted, using type + order matching,
+/// including the vLLM 0.23 fixed-position layout:
+///
+/// ```text
+/// [tag, block_hashes, parent_block_hash?, token_ids, block_size,
+///  lora_id?, medium?, lora_name?, extra_keys?, group_idx?,
+///  kv_cache_spec_kind?, kv_cache_spec_sliding_window?]
+/// ```
+///
+/// Fields without defaults keep their positions even when their value is
+/// null. Only trailing fields with defaults may be omitted by msgspec's
+/// ``omit_defaults=True`` encoding.
 #[derive(Debug)]
 pub(crate) struct VllmEventMap {
     event_type: String,
@@ -179,7 +191,11 @@ impl<'de> Deserialize<'de> for VllmEventMap {
                         fields.push((key, value));
                     }
                 }
-                let event_type = event_type.unwrap_or_default();
+                let event_type = event_type.ok_or_else(|| {
+                    <A::Error as serde::de::Error>::custom(
+                        "vLLM event map requires a string type field",
+                    )
+                })?;
                 parse_vllm_event_map(event_type, &fields).map_err(serde::de::Error::custom)
             }
         }
@@ -223,17 +239,42 @@ fn flex_hash_from_rmpv(v: &rmpv::Value) -> Option<FlexHash> {
 }
 
 fn flex_hashes_from_rmpv(v: &rmpv::Value) -> Option<Vec<FlexHash>> {
-    v.as_array()
-        .map(|arr| arr.iter().filter_map(flex_hash_from_rmpv).collect())
+    v.as_array()?.iter().map(flex_hash_from_rmpv).collect()
 }
 
 fn i64_vec_from_rmpv(v: &rmpv::Value) -> Option<Vec<i64>> {
-    v.as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+    v.as_array()?.iter().map(rmpv::Value::as_i64).collect()
 }
 
 fn u32_from_rmpv(v: &rmpv::Value) -> Option<u32> {
     v.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+fn string_from_rmpv(v: &rmpv::Value) -> Option<String> {
+    match v {
+        rmpv::Value::String(s) => s.as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+fn validate_block_stored(event: VllmEventMap) -> Result<VllmEventMap, String> {
+    if event.block_hashes.is_none() {
+        return Err("BlockStored requires a valid block_hashes array".to_string());
+    }
+    if event.token_ids.is_none() {
+        return Err("BlockStored requires a valid token_ids array".to_string());
+    }
+    if !matches!(event.block_size, Some(size) if size > 0) {
+        return Err("BlockStored requires a positive block_size".to_string());
+    }
+    Ok(event)
+}
+
+fn validate_block_removed(event: VllmEventMap) -> Result<VllmEventMap, String> {
+    if event.block_hashes.is_none() {
+        return Err("BlockRemoved requires a valid block_hashes array".to_string());
+    }
+    Ok(event)
 }
 
 fn rmpv_type_name(v: &rmpv::Value) -> &'static str {
@@ -281,6 +322,56 @@ fn parse_block_stored_values(
     event_type: String,
     values: &[rmpv::Value],
 ) -> Result<VllmEventMap, String> {
+    // vLLM 0.23 BlockStored has seven non-default fields after the tag.
+    // Nullable values among them are encoded as explicit nil placeholders:
+    //
+    // [hashes, parent_hash, token_ids, block_size, lora_id, medium, lora_name,
+    //  extra_keys?, group_idx?, spec_kind?, sliding_window?]
+    //
+    // Detect that fixed-position format before falling back to the compact
+    // format used by older publishers and tests.
+    let is_v023_layout = values.len() >= 7
+        && matches!(values[0], rmpv::Value::Array(_))
+        && matches!(values[2], rmpv::Value::Array(_))
+        && matches!(values[3], rmpv::Value::Integer(_));
+
+    if is_v023_layout {
+        let valid_nullable_fields = (values[1].is_nil()
+            || flex_hash_from_rmpv(&values[1]).is_some())
+            && (values[4].is_nil() || matches!(values[4], rmpv::Value::Integer(_)))
+            && (values[5].is_nil() || matches!(values[5], rmpv::Value::String(_)))
+            && (values[6].is_nil() || matches!(values[6], rmpv::Value::String(_)))
+            && values
+                .get(7)
+                .is_none_or(|v| v.is_nil() || matches!(v, rmpv::Value::Array(_)))
+            && values
+                .get(8)
+                .is_none_or(|v| v.is_nil() || matches!(v, rmpv::Value::Integer(_)))
+            && values
+                .get(9)
+                .is_none_or(|v| v.is_nil() || matches!(v, rmpv::Value::String(_)))
+            && values
+                .get(10)
+                .is_none_or(|v| v.is_nil() || matches!(v, rmpv::Value::Integer(_)));
+        if !valid_nullable_fields {
+            return Err("BlockStored has invalid fixed-position optional fields".to_string());
+        }
+        return validate_block_stored(VllmEventMap {
+            event_type,
+            block_hashes: flex_hashes_from_rmpv(&values[0]),
+            parent_block_hash: flex_hash_from_rmpv(&values[1]),
+            token_ids: i64_vec_from_rmpv(&values[2]),
+            block_size: u32_from_rmpv(&values[3]),
+            lora_id: values.get(4).and_then(rmpv::Value::as_i64),
+            medium: values.get(5).and_then(string_from_rmpv),
+            lora_name: values.get(6).and_then(string_from_rmpv),
+            group_idx: values.get(8).and_then(u32_from_rmpv),
+            kv_cache_spec_kind: values.get(9).and_then(string_from_rmpv),
+            kv_cache_spec_sliding_window: values.get(10).and_then(u32_from_rmpv),
+        });
+    }
+
+    // Compact format: explicit nils do not carry positional meaning.
     let values: Vec<&rmpv::Value> = values.iter().filter(|v| !v.is_nil()).collect();
     let len = values.len();
     let mut p: usize = 0;
@@ -383,7 +474,7 @@ fn parse_block_stored_values(
         None
     };
 
-    Ok(VllmEventMap {
+    validate_block_stored(VllmEventMap {
         event_type,
         block_hashes,
         parent_block_hash,
@@ -402,6 +493,21 @@ fn parse_block_removed_values(
     event_type: String,
     values: &[rmpv::Value],
 ) -> Result<VllmEventMap, String> {
+    // vLLM 0.23 keeps the required nullable medium at index 1 even when
+    // it is nil. group_idx is the only optional trailing field.
+    if values.len() >= 2
+        && matches!(values[0], rmpv::Value::Array(_))
+        && (values[1].is_nil() || matches!(values[1], rmpv::Value::String(_)))
+    {
+        return validate_block_removed(VllmEventMap::with_removed(
+            event_type,
+            flex_hashes_from_rmpv(&values[0]),
+            string_from_rmpv(&values[1]),
+            values.get(2).and_then(u32_from_rmpv),
+        ));
+    }
+
+    // Compact format: explicit nils do not carry positional meaning.
     let values: Vec<&rmpv::Value> = values.iter().filter(|v| !v.is_nil()).collect();
     let len = values.len();
     let mut p: usize = 0;
@@ -432,7 +538,7 @@ fn parse_block_removed_values(
         None
     };
 
-    Ok(VllmEventMap::with_removed(
+    validate_block_removed(VllmEventMap::with_removed(
         event_type,
         block_hashes,
         medium,
@@ -446,7 +552,7 @@ fn parse_block_removed_values(
 /// them explicitly (``block_hashes``, ``parent_block_hash``, ``token_ids``,
 /// ``block_size``, ``medium``, ``group_idx``, ``kv_cache_spec_kind``). Unknown
 /// keys are ignored so future vLLM fields (e.g. ``locality``, ``extra_keys``)
-/// do not break decoding.
+/// do not break decoding, but unknown event types are rejected.
 fn parse_vllm_event_map(
     event_type: String,
     fields: &[(String, rmpv::Value)],
@@ -469,7 +575,7 @@ fn parse_vllm_event_map(
             let kv_cache_spec_kind =
                 get("kv_cache_spec_kind").and_then(|v| v.as_str().map(|s| s.to_string()));
 
-            Ok(VllmEventMap {
+            validate_block_stored(VllmEventMap {
                 event_type,
                 block_hashes,
                 parent_block_hash,
@@ -488,7 +594,7 @@ fn parse_vllm_event_map(
             let medium = get("medium").and_then(|v| v.as_str().map(|s| s.to_string()));
             let group_idx = get("group_idx").and_then(u32_from_rmpv);
 
-            Ok(VllmEventMap::with_removed(
+            validate_block_removed(VllmEventMap::with_removed(
                 event_type,
                 block_hashes,
                 medium,
@@ -496,7 +602,7 @@ fn parse_vllm_event_map(
             ))
         }
         "AllBlocksCleared" => Ok(VllmEventMap::empty(event_type)),
-        _ => Ok(VllmEventMap::empty(event_type)),
+        _ => Err(format!("unsupported vLLM event type: {event_type:?}")),
     }
 }
 
@@ -802,6 +908,11 @@ pub(crate) fn apply_vllm_event(
 
             let event_medium = medium.as_deref().unwrap_or("npu");
             let is_non_hbm = !StorageMedium::is_hbm_key(event_medium);
+            if !is_non_hbm && match_mode == MatchMode::IpOnly {
+                return Err(KvConductorError::KvCacheEvent(
+                    "IpOnly vLLM events cannot write the exact-DP NPU tier".to_string(),
+                ));
+            }
 
             let computed_hashes: Vec<u64> = if token_ids.is_empty() || *block_size == 0 {
                 block_hashes.to_vec()

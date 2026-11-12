@@ -846,10 +846,8 @@ impl IndexerEntry {
         }
     }
 
-    /// Remove all cache entries for a given instance and DP rank across
-    /// **all** storage media.
-    pub fn remove_worker_all_media(&self, instance_id: &str, dp_rank: u32) {
-        // HBM tree
+    /// Remove HBM cache entries for a given instance and DP rank.
+    pub fn remove_worker_hbm(&self, instance_id: &str, dp_rank: u32) {
         {
             let mut lookups = self.lookups.write();
             let matching: Vec<WorkerKey> = lookups
@@ -864,6 +862,12 @@ impl IndexerEntry {
                 lookups.remove(wk);
             }
         }
+    }
+
+    /// Remove all cache entries for a given instance and DP rank across
+    /// **all** storage media.
+    pub fn remove_worker_all_media(&self, instance_id: &str, dp_rank: u32) {
+        self.remove_worker_hbm(instance_id, dp_rank);
         // CPU / Disk continuation-edge indexes
         for wk in self.cpu_tiers.worker_keys() {
             if wk.instance_id == instance_id && wk.dp_rank == dp_rank {
