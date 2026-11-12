@@ -127,6 +127,8 @@ class ScheduledResource(BaseModel):
 
     instance: Instance | None = None
     endpoint: Endpoint | None = None
+    # Scheduler delivery identity; independent of RequestManager's workload key.
+    attempt_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,7 @@ class UpdateWorkloadParams:
     workload_action: WorkloadAction
     workload_change: Workload
     operation_id: str | None = None
+    attempt_seq: int | None = None
 
 
 class SchedulingFacade(Protocol):
@@ -159,6 +162,8 @@ class SchedulingFacade(Protocol):
         target_instance_id: int | None = None,
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
+        attempt_seq: int | None = None,
+        coordination_mode: str | None = None,
     ) -> tuple[Instance, Endpoint, Workload] | None:
         """
         Atomic: select instance + one workload allocation (ALLOCATION).
@@ -166,6 +171,47 @@ class SchedulingFacade(Protocol):
         Engine type and dispatch capability constraints filter eligible instances before selection.
         Returns (instance, endpoint, allocation_workload). Caller records allocation_workload for release.
         """
+        ...
+
+    async def tars_allocate_bootstrap_joint(
+        self,
+        req_info: RequestInfo,
+        *,
+        attempt_seq: int,
+        required_engine_type: str = "sglang",
+    ) -> tuple[tuple[Instance, Endpoint, Workload], tuple[Instance, Endpoint, Workload]] | None:
+        """Atomically prepare and confirm one Bootstrap P/D pair when TARS is active."""
+        ...
+
+    def tars_has_attempt(self, request_id: str, attempt_seq: int) -> bool:
+        """Return whether the Router still owns a TARS delivery for this attempt."""
+        ...
+
+    async def tars_prefill_complete(
+        self,
+        request_id: str,
+        attempt_seq: int,
+        observed_ttft: float | None = None,
+    ) -> bool:
+        """Settle a confirmed TARS Prefill workload."""
+        ...
+
+    async def tars_request_complete(self, request_id: str, attempt_seq: int) -> bool:
+        """Complete a confirmed TARS request."""
+        ...
+
+    async def tars_abort(self, request_id: str, attempt_seq: int) -> bool:
+        """Abort a confirmed TARS attempt."""
+        ...
+
+    async def tars_commit_decode(
+        self,
+        request_id: str,
+        attempt_seq: int,
+        instance_id: int,
+        dp_rank: int,
+    ) -> bool:
+        """Bind the deferred Decode target to a confirmed single-role attempt."""
         ...
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:

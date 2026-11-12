@@ -85,7 +85,8 @@ def test_infer_base_url_for_resource_keeps_ipv4_format():
 
 
 @pytest.mark.asyncio
-async def test_prepare_resource_rolls_back_scheduler_allocation_when_local_record_fails():
+@pytest.mark.parametrize("attempt_seq", [None, 3])
+async def test_prepare_resource_rolls_back_scheduler_allocation_when_local_record_fails(attempt_seq):
     config = CoordinatorConfig()
     config.exception_config.max_retry = 1
     req_info = _make_req_info()
@@ -100,7 +101,7 @@ async def test_prepare_resource_rolls_back_scheduler_allocation_when_local_recor
     router = _TestRouter(req_info, config, scheduler=scheduler, request_manager=request_manager)
 
     with pytest.raises(HTTPException):
-        await router.prepare_resource(PDRole.ROLE_E)
+        await router.prepare_resource(PDRole.ROLE_E, attempt_seq=attempt_seq)
 
     scheduler.update_workload.assert_called_once()
     params = scheduler.update_workload.call_args.args[0]
@@ -109,6 +110,7 @@ async def test_prepare_resource_rolls_back_scheduler_allocation_when_local_recor
     assert params.role == PDRole.ROLE_E
     assert params.workload_action == WorkloadAction.RELEASE_TOKENS
     assert params.workload_change == Workload(active_tokens=-12)
+    assert params.attempt_seq == attempt_seq
 
 
 @pytest.mark.asyncio

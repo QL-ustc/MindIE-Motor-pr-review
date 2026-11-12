@@ -222,7 +222,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
-| `TarsPolicy` (dormant) | Stable dual-hash plus cache-credit/TTFT selection over pure data models | Not selectable until the later public-activation gate |
+| `TarsPolicy` | Stable dual-hash plus exact-DP cache-credit/TTFT selection, backed by explicit admission state | Select both role policies as `tars`; intended for validated P/D or unified TARS deployments |
 | `DynamicBucketPolicy` | Splits endpoints into deterministic short/long buckets, then combines request length affinity with each bucket's active-token load | Mixed short/long decode workloads |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
@@ -241,9 +241,12 @@ size, and treats an omitted registered tuple as zero. Missing registration,
 namespace mismatch, invalid schema, or query failure invalidates the complete
 evidence set. NPU credit is available only when the server supplies
 `exact_dp_npu_provenance=true`; missing/false provenance is valid but yields
-zero creditable NPU blocks. For unavailable evidence, load-balancer fallback is
+zero creditable NPU blocks. Optional `npu_end`, `cpu_end`, and `disk_end` coverage
+metadata must be nonnegative integers (excluding booleans); credit comes only from
+the required exclusive block counts and provenance. Rust serializer/Python adapter
+tests share JSON and MessagePack vectors. For unavailable evidence, load-balancer fallback is
 permitted only before admission with a provable TARS mutation count of zero;
-otherwise the later stateful layer must use STATUS/revocation and fail closed.
+otherwise the stateful activation layer must use STATUS/revocation and fail closed.
 
 Conductor registration/reconciliation uses the runtime instance model for pool
 and per-DP registrations, rejects mixed runtime models, queries only `/workers`
@@ -251,16 +254,18 @@ and per-DP registrations, rejects mixed runtime models, queries only `/workers`
 control-plane restart requiring cold pool/per-DP re-registration. Worker
 presence is not cache readiness and does not imply warm-hit preservation.
 
-**Dormant TARS data and state path** (`scheduler/policy/tars/`) is intentionally
-not registered in `SchedulerType` or `SchedulingPolicyFactory`. Its
-original-core sub-package contains immutable models, TTFT scoring, and
-selection; the upstream-derived algorithm license is retained in
-`original/LICENSE`. Import and normal `Scheduler` construction do not query
-Conductor, start threads, mutate workload, or create TARS queue state.
+**TARS data and state path** (`scheduler/policy/tars/`) is registered as
+`SchedulerType.TARS` and in `SchedulingPolicyFactory`. Its original-core
+sub-package contains immutable models, TTFT scoring, and selection; the
+upstream-derived algorithm license is retained in `original/LICENSE`. The
+activation bridge is constructed only when `SchedulerConfig.uses_tars()` validates
+both `prefill_scheduler_type` and `decode_scheduler_type` as `tars`, so importing
+Motor or constructing a Scheduler in any other mode does not query Conductor,
+mutate workload, or create TARS queue state.
 
-`TarsStateRuntime` is an explicit, in-process state aggregate for the later
+`TarsStateRuntime` is an explicit, in-process state aggregate for the TARS-only
 runtime-activation layer. `Scheduler.create_tars_state_runtime()` lazily creates
-at most one aggregate per Scheduler; no existing scheduling call invokes it.
+at most one aggregate per Scheduler; non-TARS scheduling calls do not invoke it.
 The aggregate is the sole owner of queued attempts, per-target queue indexes,
 reservations, workloads, replica pending/running indexes, and capacity
 accounting. Each attempt is identified by `(request_id, attempt_seq)` and can
@@ -285,8 +290,8 @@ charged across both reserved-prefill and running phases. Remaining pending TTFT
 is derived from the injected monotonic clock, making timeout/budget tests
 deterministic.
 
-`handoff_protocol.py` adds a dormant, transport-neutral Scheduler/Router
-protocol above this aggregate. A Handoff attempt reserves Prefill first, writes
+`handoff_protocol.py` provides the transport-neutral Scheduler/Router protocol
+used by the TARS activation bridge. A Handoff attempt reserves Prefill first, writes
 a pending-delivery record, requires the Router to persist the exact
 `(request_id, attempt_seq, scheduler_epoch, target, delivery_token)` before
 confirmation, and permits dispatch only after confirmation transfers
@@ -316,10 +321,38 @@ returning to `RUNNING`. This is epoch isolation, not transaction recovery: no
 pending delivery, reservation, workload, or warm cache claim is replayed.
 
 `quiesce()` removes protocol and Router transient ledgers but retains target and
-replica inventory. This layer is not registered in `SchedulerType`, does not
-add ZMQ message types, has no endpoint allocation or public configuration, and
-does not alter `ALLOCATE_ONLY`, Trigger, Handoff, Bootstrap, or PDHybrid runtime
-paths. Transport wiring and public activation remain later gates.
+replica inventory. `runtime/tars_activation.py` maps logical targets to Motor
+instances/endpoints and exposes prepare, confirm, status, revoke, lifecycle,
+drain, and quiesce operations through TARS-only ZMQ messages. Existing
+Worker-local SHM CAS allocations for ordinary Decode and pre-admission fallback
+do not enter this bridge.
+Scheduler stop first enters drain, rejects new single/joint admissions while
+continuing lifecycle RPCs, then closes transport after ownership converges or
+the configured drain deadline compensates every remaining actual workload.
+
+`runtime/tars_workload.py` commits TARS allocations through the existing schema-5
+native SHM CAS API. Mgmt retains receipts containing the original endpoint generation
+and amount, independent of mutable InstanceManager workload snapshots. Prepare retries
+reuse the same receipt. Terminal lifecycle, revoke, expiry, drain and explicit
+`TARS_RELEASE_WORKLOAD` settle that receipt once; a transient release failure retains
+it for polling/retry. Release RPCs authenticate delivery identity/token and role/target,
+then subtract the recorded amount, never a caller-supplied delta. A retired generation
+cannot debit a newly registered endpoint. Settled receipts have a bounded retry window;
+an expired/unknown receipt fails closed. Clients retain server-owned receipt identity
+past terminal lifecycle so late generic cleanup cannot fall through to ordinary CAS.
+Mgmt and Infer Workers must deploy this protocol version together.
+After successful delivery confirmation, the Client records the selected session
+endpoint, Agent session epoch and explicit cache TTL using the same bookkeeping
+as ordinary allocations. Disabling affinity routing does not disable this location
+ledger, which KVC offload/prefetch/evict needs. Agent session epochs are independent
+of TARS Scheduler epochs; finalizing session metadata does not release TARS workload
+receipts or change the TARS-selected target.
+Shutdown bounds drain by the configured timeout and makes one final compensation
+attempt before closing transport/SHM. If native settlement remains unavailable,
+it logs an explicit forced cold stop; it does not claim successful convergence or
+recovery of in-flight work. Optional shared session affinity imports POSIX locking
+only when available; its constructor fails before opening a file without `fcntl`,
+allowing the existing factory fallback to the in-process table.
 
 `single_role_adapters.py` reuses that confirmed-delivery protocol without
 flattening the Router's mode-specific timing. Trigger reserves a fresh identity
@@ -334,8 +367,9 @@ PDHybrid admits only an explicit `UNIFIED` target and assigns a fresh attempt
 identity to every retry. A combined engine has no physical Prefill completion
 boundary, so the adapter rejects `prefill_complete`, retains capacity until
 `request_complete` or `abort`, and rejects stale identities and Scheduler
-epochs. Both adapters remain dormant: production Router modules do not import
-them, and they add no public configuration or transport endpoint.
+epochs. Production routing preserves these mode boundaries: Trigger admits P
+only from its post-D metaserver callback, Handoff admits P before dispatch and
+keeps D deferred, and PDHybrid admits one `ROLE_U` target.
 
 `bootstrap_joint_protocol.py` models the separate Bootstrap-only P/D ownership
 boundary. Its identity-free preflight rejects non-Bootstrap mode, stale epochs,
@@ -353,9 +387,9 @@ Pre-confirm failures revoke the joint allocation and compensate Decode before
 Prefill. After ownership transfer, `prefill_complete` idempotently releases
 only Prefill, while `request_complete` releases Decode; any post-confirm fault
 aborts the remaining pair. Duplicate joint admission is rejected rather than
-joined or taken over. This protocol remains dormant and transport-neutral: it
-is not imported by production Router code, registered in `SchedulerType`,
-exposed through ZMQ, or configured publicly.
+joined or taken over. Production routing exposes joint admission only for
+SGLang Bootstrap, where P and D must become visible atomically; other modes
+cannot invoke the joint protocol.
 
 TARS logical target identity is exactly `(str(instance.id), dp_rank)`; endpoint
 IP, port, pod name, endpoint object, and candidate-list position are transport
@@ -384,12 +418,17 @@ credit. An available but non-provenance tuple is compute-only; a missing or
 extra tuple invalidates the complete batch. Terms `local` and `remote` are not
 used because neither DP nor physical-node placement follows from media tier.
 Unavailable evidence preserves the K3 pre-admission zero-mutation LB fallback
-versus post-admission STATUS/revocation boundary, but this dormant stage does
-not implement admission state or dispatch.
+versus post-admission STATUS/revocation boundary. After any admission mutation,
+the activation layer must reconcile with STATUS/revocation and fail closed.
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
 The policy is selected per role by `SchedulerConfig.type_for_role()`: `prefill_scheduler_type` serves Prefill, Encode and Union; `decode_scheduler_type` serves Decode. Both default to `LOAD_BALANCE`; Decode supports load balance / round robin / dynamic bucket, while KV affinity applies only to P/U. Deprecated `scheduler_type` migrates only to role fields that are not explicitly configured. When a role uses `kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
+
+TARS requires both role policies to select `SchedulerType.TARS`; mixed TARS/non-TARS
+roles are rejected before runtime creation, including programmatically mutated configuration.
+Its settings live under `scheduler_config.tars`. The deployer applies explicit role fields
+first and uses deprecated `scheduler_type` only for omitted roles. KV affinity sub-modes are:
 
 - `unified` (default) — single score fusing affinity and live load; pick the minimum
 - `load_gated` — keep the N least-loaded endpoints, then pick the longest cached prefix
@@ -562,7 +601,8 @@ Hot-reload is driven by a process-local `ConfigWatcher` in the **Inference Worke
 | `motor/coordinator/process/constants.py` | | Process keys, start/stop order |
 | `motor/coordinator/scheduler/scheduler.py` | | `Scheduler`: Mgmt precision sampling/alarm state (not SchedulingFacade) |
 | `motor/coordinator/scheduler/policy/factory.py` | | `SchedulingPolicyFactory` registry |
-| `motor/coordinator/scheduler/policy/tars/` | | Dormant TARS models/scorer/selector, evidence and mode adapters, state aggregate, and lease/epoch-isolated delivery protocol |
+| `motor/coordinator/scheduler/policy/tars/` | | TARS models/scorer/selector, evidence and mode adapters, state aggregate, and lease/epoch-isolated delivery protocol |
+| `motor/coordinator/scheduler/runtime/tars_activation.py` | | TARS-only bridge from protocol state to Motor instances, workload ledger, Conductor evidence, and Router delivery RPCs |
 | `motor/coordinator/scheduler/runtime/scheduler_server.py` | | `AsyncSchedulerServer`: Mgmt control plane (ROUTER+PUB, CB, precision, SHM owner) |
 | `motor/coordinator/scheduler/runtime/scheduler_client.py` | | `AsyncSchedulerClient`: control-plane DEALER + instance cache + SHM CAS |
 | `motor/coordinator/scheduler/runtime/dp_stats.py` | | Per-worker timer: per-DP request counts + shared SHM `active_tokens`; preserve nonzero windows, skip unchanged idle snapshots, flush on disconnect |

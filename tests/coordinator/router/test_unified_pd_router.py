@@ -102,10 +102,12 @@ async def test_decode_first_token_timeout_is_absolute_and_stops_after_first_item
         await release_second_item.wait()
         yield b"second"
 
-    wrapped = UnifiedPDRouter._iter_with_first_item_timeout(two_item_stream(), 0.01)
+    # A successful event-loop round trip must tolerate Windows' clock quantum.
+    first_item_timeout = 1.0
+    wrapped = UnifiedPDRouter._iter_with_first_item_timeout(two_item_stream(), first_item_timeout)
     assert await anext(wrapped) == b"first"
     second_item_task = asyncio.create_task(anext(wrapped))
-    await asyncio.sleep(0.02)
+    await asyncio.sleep(first_item_timeout + 0.1)
     assert not second_item_task.done()
     release_second_item.set()
     assert await asyncio.wait_for(second_item_task, timeout=1) == b"second"
@@ -118,7 +120,7 @@ async def test_decode_first_token_timeout_preserves_empty_stream_completion():
         for item in items:
             yield item
 
-    wrapped = UnifiedPDRouter._iter_with_first_item_timeout(empty_stream(), 0.01)
+    wrapped = UnifiedPDRouter._iter_with_first_item_timeout(empty_stream(), 1.0)
     with pytest.raises(StopAsyncIteration):
         await anext(wrapped)
 
@@ -184,6 +186,42 @@ class _Scheduler:
     async def get_unblocked_instances(self, role) -> list:
         """Return both instances as unblocked (no circuit breaker in test)."""
         return [self.p.id, self.d.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("bookkeeping failed"), asyncio.CancelledError()])
+async def test_tars_joint_bookkeeping_failure_rolls_back_both_attempt_resources(failure):
+    config = _config()
+    manager = RequestManager(config)
+    scheduler = _Scheduler()
+    scheduler.tars_abort = AsyncMock(return_value=True)
+    req_info = RequestInfo(req_id="joint-bookkeeping", req_data={}, req_len=1, api="/test")
+    router = UnifiedPDRouter(req_info, config, scheduler=scheduler, request_manager=manager)
+    await manager.add_req_info(req_info)
+    original_add = manager.add_req_attempt_workload
+
+    async def interrupted_add(request_id, attempt_seq, role, workload, **kwargs):
+        result = await original_add(request_id, attempt_seq, role, workload, **kwargs)
+        if role == PDRole.ROLE_D:
+            raise failure
+        return result
+
+    manager.add_req_attempt_workload = interrupted_add
+    joint = tuple(
+        (instance, instance.get_all_endpoints()[0], Workload(active_tokens=7))
+        for instance in (scheduler.p, scheduler.d)
+    )
+    with pytest.raises(type(failure)):
+        await router._record_tars_joint_attempt(PDDispatchSession(req_info.req_id), 3, joint)
+
+    scheduler.tars_abort.assert_awaited_once_with(req_info.req_id, 3)
+    releases = [call.args[0] for call in scheduler.update_workload.call_args_list]
+    assert [(params.role, params.attempt_seq) for params in releases] == [
+        (PDRole.ROLE_D, 3),
+        (PDRole.ROLE_P, 3),
+    ]
+    assert await manager.pop_residual_workloads(req_info.req_id) == []
+    await manager.del_req_info(req_info.req_id)
 
 
 class _Client:

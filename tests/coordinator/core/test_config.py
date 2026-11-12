@@ -1411,6 +1411,121 @@ def test_from_json_loads_nested_kv_affinity(_temp_json_file):
     assert affinity.hit_rate_threshold == 0.3
 
 
+def test_from_json_loads_public_tars_config(_temp_json_file):
+    test_config = {
+        "scheduler_config": {
+            "scheduler_type": "tars",
+            "tars": {
+                "fallback_policy": "round_robin",
+                "pending_token_capacity": 2048,
+                "running_block_capacity": 128,
+                "decode_token_capacity": 4096,
+                "server_timeout_s": 9.0,
+                "client_timeout_s": 10.0,
+                "delivery_lease_s": 11.0,
+            },
+        }
+    }
+    with open(_temp_json_file, "w", encoding="utf-8") as f:
+        json.dump(test_config, f)
+
+    config = CoordinatorConfig.from_json(_temp_json_file)
+
+    assert config.scheduler_config.scheduler_type.value == "tars"
+    assert config.scheduler_config.tars.fallback_policy == "round_robin"
+    assert config.scheduler_config.tars.pending_token_capacity == 2048
+    assert config.scheduler_config.tars.running_block_capacity == 128
+    assert config.scheduler_config.tars.decode_token_capacity == 4096
+    config.validate_config()
+
+
+def test_from_json_rejects_retired_tars_field(_temp_json_file):
+    test_config = {
+        "scheduler_config": {
+            "scheduler_type": "tars",
+            "tars": {"kv_conductor_reuse_scope": "cross_instance_pool"},
+        }
+    }
+    with open(_temp_json_file, "w", encoding="utf-8") as f:
+        json.dump(test_config, f)
+
+    with pytest.raises(ValueError, match="Unknown scheduler_config.tars field"):
+        CoordinatorConfig.from_json(_temp_json_file)
+
+
+@pytest.mark.parametrize(
+    "scheduler_config",
+    [
+        {"prefill_scheduler_type": "tars"},
+        {"decode_scheduler_type": "tars"},
+        {"scheduler_type": "tars", "prefill_scheduler_type": "load_balance"},
+        {"scheduler_type": "tars", "decode_scheduler_type": "round_robin"},
+    ],
+)
+def test_tars_config_rejects_unpaired_roles_after_legacy_migration(tmp_path, scheduler_config):
+    """A legacy default cannot turn an explicit single-role override into a joint protocol."""
+    path = tmp_path / "unpaired.json"
+    path.write_text(json.dumps({"scheduler_config": scheduler_config}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="prefill_scheduler_type and decode_scheduler_type"):
+        config = CoordinatorConfig.from_json(str(path))
+        config.validate_config()
+
+
+@pytest.mark.parametrize(
+    ("scheduler_config", "expected_roles", "enabled"),
+    [
+        ({"scheduler_type": "tars"}, ("tars", "tars"), True),
+        (
+            {"prefill_scheduler_type": "tars", "decode_scheduler_type": "tars"},
+            ("tars", "tars"),
+            True,
+        ),
+        (
+            {
+                "scheduler_type": "tars",
+                "prefill_scheduler_type": "load_balance",
+                "decode_scheduler_type": "round_robin",
+            },
+            ("load_balance", "round_robin"),
+            False,
+        ),
+    ],
+)
+def test_tars_config_accepts_joint_roles_and_preserves_explicit_overrides(
+    tmp_path, scheduler_config, expected_roles, enabled
+):
+    path = tmp_path / "paired.json"
+    path.write_text(json.dumps({"scheduler_config": scheduler_config}), encoding="utf-8")
+
+    config = CoordinatorConfig.from_json(str(path))
+    config.validate_config()
+
+    assert (
+        config.scheduler_config.prefill_scheduler_type.value,
+        config.scheduler_config.decode_scheduler_type.value,
+    ) == expected_roles
+    assert config.scheduler_config.uses_tars() is enabled
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error"),
+    [
+        ("pending_token_capacity", 0, "positive integer"),
+        ("server_timeout_s", 4.0, "stage budget"),
+        ("client_timeout_s", 5.0, "exceed tars.server_timeout_s"),
+        ("delivery_lease_s", 6.0, "exceed tars.client_timeout_s"),
+        ("drain_timeout_s", 10.0, "exceed tars.delivery_lease_s"),
+    ],
+)
+def test_tars_config_validation_rejects_unsafe_stateful_values(field_name, value, error):
+    config = CoordinatorConfig()
+    setattr(config.scheduler_config.tars, field_name, value)
+
+    with pytest.raises(ValueError, match=error):
+        config.validate_config()
+
+
 def test_from_json_migrates_legacy_flat_kv_affinity_keys(_temp_json_file, caplog):
     test_config = {
         "scheduler_config": {

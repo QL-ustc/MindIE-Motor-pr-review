@@ -9,9 +9,9 @@
 # See the Mulan PSL v2 for more details.
 
 """
-Control-plane server owned by the Mgmt process: ZMQ ROUTER + PUB, schema-4 SHM,
-circuit breaker, and precision sampling. Infer Workers CAS-commit on SHM; there
-is no per-request ALLOCATE / UPDATE RPC and no standalone Scheduler process.
+Control-plane server owned by the Mgmt process: ZMQ ROUTER + PUB, schema-5 SHM,
+circuit breaker, and precision sampling. Infer Workers CAS-commit on SHM; ordinary requests
+have no ALLOCATE / UPDATE RPC. TARS receipts are allocated and released by Mgmt.
 IPC paths remain scheduler_frontend / scheduler_instance_pub (bound by Mgmt).
 """
 
@@ -168,6 +168,7 @@ class _SchedulerRequestDispatcher:
         kv_usage_writer: KvUsageShmWriter | None = None,
         sched_metrics_writer: SchedulerMetricsShmWriter | None = None,
     ):
+        tars_enabled = config.scheduler_config.uses_tars()
         self._instance_manager = instance_manager
         self._scheduler = scheduler
         self._config = config
@@ -186,6 +187,23 @@ class _SchedulerRequestDispatcher:
         # True when InstanceManager has changes not yet reflected in the SHM snapshot; drained by
         # _retry_dirty_snapshot (also forces a resync on the next apply_refresh).
         self._snapshot_dirty = False
+        self._endpoint_instance_score_weight = max(
+            0.0,
+            getattr(config.scheduler_config, "endpoint_instance_score_weight", 0.05),
+        )
+        self._tars_activation = None
+        if tars_enabled:
+            from motor.coordinator.scheduler.runtime.tars_activation import (
+                TarsRuntimeActivation,
+            )
+
+            self._tars_activation = TarsRuntimeActivation(
+                scheduler,
+                instance_manager,
+                config,
+                workload_owner=self._workload_writer,
+                circuit_open=self._cb_manager.is_open,
+            )
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch control-plane request to the appropriate handler."""
@@ -199,6 +217,19 @@ class _SchedulerRequestDispatcher:
             SchedulerRequestType.CIRCUIT_BREAKER_REPORT.value: self._handle_circuit_breaker_report,
             SchedulerRequestType.AGENT_STATUS_NOTIFY.value: self._handle_agent_status_notify,
         }
+        if self._tars_activation is not None:
+            handlers.update(
+                {
+                    SchedulerRequestType.TARS_PREPARE_SINGLE.value: self._handle_tars_prepare_single,
+                    SchedulerRequestType.TARS_PREPARE_JOINT.value: self._handle_tars_prepare_joint,
+                    SchedulerRequestType.TARS_CONFIRM.value: self._handle_tars_confirm,
+                    SchedulerRequestType.TARS_REVOKE.value: self._handle_tars_revoke,
+                    SchedulerRequestType.TARS_STATUS.value: self._handle_tars_status,
+                    SchedulerRequestType.TARS_LIFECYCLE.value: self._handle_tars_lifecycle,
+                    SchedulerRequestType.TARS_COMMIT_DECODE.value: self._handle_tars_commit_decode,
+                    SchedulerRequestType.TARS_RELEASE_WORKLOAD.value: self._handle_tars_release_workload,
+                }
+            )
         handler = handlers.get(request.request_type)
         if handler:
             result = handler(request)
@@ -210,6 +241,55 @@ class _SchedulerRequestDispatcher:
             request_id=request.request_id,
             error=f"Unknown request type: {request.request_type}",
         )
+
+    async def _handle_tars_prepare_single(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, await self._tars_activation.prepare_single(request.data))
+
+    async def _handle_tars_prepare_joint(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, await self._tars_activation.prepare_joint(request.data))
+
+    def _handle_tars_confirm(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, self._tars_activation.confirm(request.data))
+
+    def _handle_tars_revoke(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, self._tars_activation.revoke(request.data))
+
+    def _handle_tars_status(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, self._tars_activation.status(request.data))
+
+    def _handle_tars_lifecycle(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, self._tars_activation.lifecycle(request.data))
+
+    def _handle_tars_commit_decode(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, self._tars_activation.commit_decode(request.data))
+
+    def _handle_tars_release_workload(self, request: SchedulerRequest) -> SchedulerResponse:
+        return self._tars_response(request, self._tars_activation.release_workload(request.data))
+
+    @staticmethod
+    def _tars_response(request: SchedulerRequest, data: dict) -> SchedulerResponse:
+        error = data.get("error")
+        return SchedulerResponse(
+            response_type=(SchedulerResponseType.ERROR if error else SchedulerResponseType.SUCCESS),
+            request_id=request.request_id,
+            data=data,
+            error=error,
+        )
+
+    def poll_tars(self) -> None:
+        if self._tars_activation is not None:
+            self._tars_activation.poll()
+
+    def begin_tars_drain(self) -> None:
+        if self._tars_activation is not None:
+            self._tars_activation.begin_drain()
+
+    def tars_drain_complete(self) -> bool:
+        return self._tars_activation is None or self._tars_activation.drain_complete()
+
+    def quiesce_tars(self) -> None:
+        if self._tars_activation is not None:
+            self._tars_activation.quiesce()
 
     def _handle_get_available_instances(self, request: SchedulerRequest) -> SchedulerResponse:
         role_str = request.data.get("role")
@@ -887,6 +967,16 @@ class AsyncSchedulerServer:
         """Stop the control plane (ROUTER, PUB, SHM, heartbeat, probe timers)."""
         logger.info("Stopping control plane...")
 
+        if self._dispatcher is not None:
+            self._dispatcher.begin_tars_drain()
+            drain_deadline = time.monotonic() + self.config.scheduler_config.tars.drain_timeout_s
+            while not self._dispatcher.tars_drain_complete():
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning("TARS graceful drain timed out; proceeding to final quiesce")
+                    break
+                await asyncio.sleep(min(0.05, remaining))
+
         self._stop_event.set()
 
         if self._loop_task and not self._loop_task.done() and self._loop_task is not asyncio.current_task():
@@ -951,6 +1041,15 @@ class AsyncSchedulerServer:
             await asyncio.gather(*self._active_tasks, return_exceptions=True)
             self._active_tasks.clear()
 
+        if self._dispatcher is not None:
+            self._dispatcher.quiesce_tars()
+            if not self._dispatcher.tars_drain_complete():
+                logger.error(
+                    "TARS workload compensation remains incomplete; forcing cold shutdown. "
+                    "Unsettled workload receipts require recovery."
+                )
+
+        # Close shared memory (release writer's buffer first to avoid BufferError: exported pointers exist)
         if self._workload_writer:
             try:
                 self._workload_writer.release()
@@ -1220,6 +1319,7 @@ class AsyncSchedulerServer:
                 if self._dispatcher is not None:
                     await self._dispatcher._retry_pending_blocked_and_publish()
                     self._dispatcher._retry_dirty_snapshot()
+                    self._dispatcher.poll_tars()
             except asyncio.CancelledError:
                 break
             except Exception as e:

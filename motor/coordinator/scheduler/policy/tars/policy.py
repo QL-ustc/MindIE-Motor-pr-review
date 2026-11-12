@@ -20,7 +20,7 @@ from motor.coordinator.scheduler.policy.tars.original.selector import select_tar
 
 
 class TarsPolicy(BaseSchedulingPolicy):
-    """Pure wrapper intentionally absent from SchedulerType and the policy factory."""
+    """TARS marker policy; active admission is owned by SchedulerServer."""
 
     def __init__(
         self,

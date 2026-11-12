@@ -58,6 +58,8 @@ class Scheduler:
             self._decode_policy_type = config
             self._config: CoordinatorConfig | None = None
         else:
+            # Programmatic callers may not have run CoordinatorConfig validation.
+            config.scheduler_config.uses_tars()
             self._prefill_policy_type = config.scheduler_config.prefill_scheduler_type
             self._decode_policy_type = config.scheduler_config.decode_scheduler_type
             self._config = config
@@ -107,7 +109,6 @@ class Scheduler:
         """Return the explicitly created dormant TARS state owner, if any."""
         return self._tars_state_runtime
 
-
     def create_tars_state_runtime(
         self,
         scheduler_id: str,
@@ -117,10 +118,7 @@ class Scheduler:
         """Lazily create the sole TARS state aggregate owned by this Scheduler."""
         if self._tars_state_runtime is not None:
             if self._tars_state_runtime.scheduler_id != scheduler_id:
-                raise RuntimeError(
-                    "Scheduler already owns a TARS runtime for "
-                    f"{self._tars_state_runtime.scheduler_id}"
-                )
+                raise RuntimeError(f"Scheduler already owns a TARS runtime for {self._tars_state_runtime.scheduler_id}")
             return self._tars_state_runtime
 
         from motor.coordinator.scheduler.policy.tars.state_runtime import TarsStateRuntime
@@ -132,6 +130,10 @@ class Scheduler:
         )
         return self._tars_state_runtime
 
+    def tars_has_attempt(self, request_id: str, attempt_seq: int) -> bool:
+        """The in-process facade never owns Router-side delivery records."""
+        del request_id, attempt_seq
+        return False
 
     async def get_available_instances(self, role: PDRole | None = None) -> dict[int, Instance]:
         """

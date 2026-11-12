@@ -29,6 +29,8 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODES,
     KvAffinityConfig,
     KvcLifecycleConfig,
+    TarsConfig,
+    is_tars_enabled,
 )
 from motor.coordinator.domain import (
     InstanceReadiness,
@@ -281,7 +283,12 @@ class _SchedulerInstanceCache:
             return False
         async with self._lock:
             for inst, role in resolved_instances:
-                for existing_role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
+                for existing_role in (
+                    PDRole.ROLE_E,
+                    PDRole.ROLE_P,
+                    PDRole.ROLE_D,
+                    PDRole.ROLE_U,
+                ):
                     role_map = self._instance_map.get(existing_role)
                     if role_map and inst.id in role_map:
                         del role_map[inst.id]
@@ -304,7 +311,12 @@ class _SchedulerInstanceCache:
         async with self._lock:
             for inst in instances:
                 iid = inst.id
-                for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
+                for role in (
+                    PDRole.ROLE_E,
+                    PDRole.ROLE_P,
+                    PDRole.ROLE_D,
+                    PDRole.ROLE_U,
+                ):
                     role_map = self._instance_map.get(role)
                     if role_map and iid in role_map:
                         del role_map[iid]
@@ -686,6 +698,7 @@ class SchedulerClientConfig:
     dynamic_bucket_long_bucket_count: int = 0
     # kv_cache_affinity tunables (see SchedulerConfig.kv_affinity).
     kv_affinity: KvAffinityConfig | None = None
+    tars: TarsConfig | None = None
     # Soft-priority admission (Agent Hint `priority`, Phase 3): endpoints whose
     # workload score reaches priority_load_threshold are excluded for NORMAL
     # requests (priority < priority_admission_level); high-priority requests bypass
@@ -718,6 +731,10 @@ class AsyncSchedulerClient:
     _cache_lifecycle_task: asyncio.Task | None = None
 
     def __init__(self, config: SchedulerClientConfig):
+        default_type = config.scheduler_type or "round_robin"
+        self._prefill_scheduler_type: str = config.prefill_scheduler_type or default_type
+        self._decode_scheduler_type: str = config.decode_scheduler_type or default_type
+        is_tars_enabled(self._prefill_scheduler_type, self._decode_scheduler_type)
         self.scheduler_address = config.scheduler_address
         self.timeout = config.timeout
         self._client_index = max(0, config.client_index)
@@ -770,9 +787,14 @@ class AsyncSchedulerClient:
         self._cache = _SchedulerInstanceCache()
         self._instance_rr_counters: dict[PDRole, int] = {}
         self._endpoint_rr_counters: dict[int, int] = {}
-        default_type = config.scheduler_type or "round_robin"
-        self._prefill_scheduler_type: str = config.prefill_scheduler_type or default_type
-        self._decode_scheduler_type: str = config.decode_scheduler_type or default_type
+        self._tars_fallback_policy = (config.tars or TarsConfig()).fallback_policy
+        self._tars_attempt_sequences: dict[str, int] | None = {} if self._tars_enabled else None
+        self._tars_ledger: dict[tuple[str, int], dict[str, Any]] | None = {} if self._tars_enabled else None
+        # A terminal lifecycle may remove the attempt before Router cleanup releases
+        # its local workload records. Keep ownership receipts until that cleanup ends.
+        self._tars_workload_receipts: dict[tuple[str, int, str, int, int], dict[str, Any]] | None = (
+            {} if self._tars_enabled else None
+        )
         self._workload_reader = None
         self._last_instance_version: int | None = None
         self._on_instance_refreshed = config.on_instance_refreshed
@@ -856,6 +878,13 @@ class AsyncSchedulerClient:
         await self._stop_dp_stats_task()
         await self._stop_cache_lifecycle_task()
         try:
+            if self._tars_ledger:
+                for request_id, attempt_seq in tuple(self._tars_ledger):
+                    entry = self._tars_entry(request_id, attempt_seq)
+                    if entry is not None and entry.get("confirmed"):
+                        await self.tars_abort(request_id, attempt_seq)
+                    elif entry is not None:
+                        await self._revoke_tars_delivery(entry)
             if self._kv_usage_reader is not None:
                 try:
                     self._kv_usage_reader.detach()
@@ -890,6 +919,46 @@ class AsyncSchedulerClient:
         except asyncio.CancelledError:
             pass
         self._emit_dp_stats()
+
+    def _record_allocation_state(
+        self,
+        role: PDRole | None,
+        req_info: RequestInfo,
+        instance: Instance,
+        endpoint: Endpoint,
+    ) -> None:
+        """Record the allocated location for Agent Hint lifecycle, independently of routing.
+
+        TARS calls this only after delivery confirmation. Its scheduler epoch is
+        separate from the Agent session epoch carried by the original request.
+        Optional hint bookkeeping must not orphan an already committed allocation.
+        """
+        table = self._session_affinity
+        hint_info = getattr(req_info, "agent_hint_info", None)
+        session_id = getattr(hint_info, "session_id", None)
+        if table is None or not session_id:
+            return
+        role_str = getattr(role, "value", "")
+        agent_epoch = getattr(getattr(hint_info, "session_hint", None), "epoch", None)
+        try:
+            table.record(
+                session_id,
+                instance.id,
+                role_str,
+                epoch=agent_epoch,
+                endpoint_id=endpoint.id,
+            )
+            # Record the promise after its actual location exists. This also applies
+            # when affinity routing is disabled but lifecycle management is enabled.
+            self._record_cache_declaration(hint_info, session_id, role_str)
+        except Exception as exc:
+            logger.warning(
+                "Agent Hint bookkeeping failed after allocation req_id=%s session_id=%s role=%s: %s",
+                req_info.req_id,
+                session_id,
+                role_str,
+                exc,
+            )
 
     def _record_cache_declaration(self, hint_info: object, session_id: str | None, role: str | None = None) -> None:
         """Record an explicit ``cache_control`` retention (design 20261015-03, step ①).
@@ -1175,7 +1244,9 @@ class AsyncSchedulerClient:
         """Select endpoint candidates from cache or fresh instances."""
         cache_role = role if role is not None else PDRole.ROLE_U
         cached_instances = self._filter_instances(
-            self._cache.get_instances(cache_role), required_engine_type, required_dispatch_capability
+            self._cache.get_instances(cache_role),
+            required_engine_type,
+            required_dispatch_capability,
         )
         if cached_instances:
             cached_instances = self._apply_priority_load_gate(cached_instances, req_info, cache_role)
@@ -1198,7 +1269,9 @@ class AsyncSchedulerClient:
 
         # get_available_instances already wrote sorted list to cache; build sorted list once for this path
         instance_list = self._filter_instances(
-            sorted(instances.values(), key=lambda i: i.id), required_engine_type, required_dispatch_capability
+            sorted(instances.values(), key=lambda i: i.id),
+            required_engine_type,
+            required_dispatch_capability,
         )
         instance_list = self._apply_priority_load_gate(instance_list, req_info, cache_role)
         if not instance_list:
@@ -1330,7 +1403,9 @@ class AsyncSchedulerClient:
         # WP-E2 hard priority: strict_priority non-None implies it survived the
         # entry trust gate (untrusted claims are stripped there) — bypass fully.
         strict_level = getattr(
-            getattr(getattr(req_info, "agent_hint_info", None), "strict_priority", None), "level", None
+            getattr(getattr(req_info, "agent_hint_info", None), "strict_priority", None),
+            "level",
+            None,
         )
         if strict_level is not None:
             return instances
@@ -1408,6 +1483,10 @@ class AsyncSchedulerClient:
         await self._notify_instance_refreshed()
 
     @property
+    def _tars_enabled(self) -> bool:
+        return is_tars_enabled(self._prefill_scheduler_type, self._decode_scheduler_type)
+
+    @property
     def _scheduler_type(self) -> str:
         """Deprecated alias of prefill type; tests may still assign this to set both roles."""
         return self._prefill_scheduler_type
@@ -1423,7 +1502,12 @@ class AsyncSchedulerClient:
         def _get_available(pool_role: PDRole | None) -> dict[int, Instance]:
             if pool_role is None:
                 merged: dict[int, Instance] = {}
-                for pdrole in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
+                for pdrole in (
+                    PDRole.ROLE_E,
+                    PDRole.ROLE_P,
+                    PDRole.ROLE_D,
+                    PDRole.ROLE_U,
+                ):
                     for inst in self._cache.get_instances(pdrole):
                         merged[inst.id] = inst
                 return merged
@@ -1484,6 +1568,8 @@ class AsyncSchedulerClient:
         target_instance_id: int | None = None,
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
+        attempt_seq: int | None = None,
+        coordination_mode: str | None = None,
     ) -> tuple[Instance, Endpoint, Workload] | None:
         """Select locally, then CAS-commit on schema-4 SHM (no ALLOCATE_ONLY ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.layout import FLAG_BLOCKED
@@ -1494,6 +1580,21 @@ class AsyncSchedulerClient:
             STATUS_SLOT_INVALID,
         )
 
+        if self._tars_enabled and role in (PDRole.ROLE_P, PDRole.ROLE_U) and coordination_mode != "fallback":
+            resolved_attempt = attempt_seq or self._next_tars_attempt(req_info.req_id)
+            resolved_mode = coordination_mode or ("unified" if role is PDRole.ROLE_U else "handoff")
+            result, fallback_allowed = await self._select_and_allocate_tars_single(
+                role,
+                req_info,
+                attempt_seq=resolved_attempt,
+                coordination_mode=resolved_mode,
+                required_engine_type=required_engine_type,
+            )
+            if result is not None:
+                return result
+            if not fallback_allowed:
+                return None
+            coordination_mode = "fallback"
         role_str = role.value if role is not None else (getattr(PDRole.ROLE_U, "value", "union"))
         await self._refresh_cache_from_workload_reader(role)
         if self._workload_reader is None or self._workload_reader.native is None:
@@ -1532,7 +1633,9 @@ class AsyncSchedulerClient:
         ):
             pool = await self.get_available_instances(role)
             eligible = self._affinity_eligible_instance_ids(
-                pool, normalized_engine_type or None, normalized_dispatch_capability or None
+                pool,
+                normalized_engine_type or None,
+                normalized_dispatch_capability or None,
             )
             decision = resolve_session_pin(
                 self._session_affinity,
@@ -1561,7 +1664,9 @@ class AsyncSchedulerClient:
                 # commit onto one instance (review 194528732).
                 pool_balanced = await self.get_available_instances(role)
                 eligible_balanced = self._affinity_eligible_instance_ids(
-                    pool_balanced, normalized_engine_type or None, normalized_dispatch_capability or None
+                    pool_balanced,
+                    normalized_engine_type or None,
+                    normalized_dispatch_capability or None,
                 )
                 if hasattr(self._session_affinity, "record_balanced"):
                     chosen = self._session_affinity.record_balanced(
@@ -1651,7 +1756,7 @@ class AsyncSchedulerClient:
             if endpoint is None:
                 endpoint = select_endpoint_for_instance(
                     instance,
-                    scheduler_type=self._scheduler_type_for_role(role),
+                    scheduler_type=self._effective_scheduler_type_for_role(role),
                     endpoint_rr_counters=self._endpoint_rr_counters,
                     is_blocked=self.is_instance_blocked,
                 )
@@ -1663,7 +1768,7 @@ class AsyncSchedulerClient:
                     req_info.req_id,
                 )
                 return None
-            candidate_policy = self._scheduler_type_for_role(role)
+            candidate_policy = self._effective_scheduler_type_for_role(role)
             candidate_endpoints = [{"instance_id": instance.id, "endpoint_id": endpoint.id}]
             proposed_instance, proposed_endpoint = instance, endpoint
         else:
@@ -1676,7 +1781,10 @@ class AsyncSchedulerClient:
                 )
                 else 1
             )
-            candidates, candidate_policy = await self._select_endpoint_candidates_with_policy(
+            (
+                candidates,
+                candidate_policy,
+            ) = await self._select_endpoint_candidates_with_policy(
                 req_info,
                 role,
                 top_k=request_top_k,
@@ -1714,7 +1822,10 @@ class AsyncSchedulerClient:
             elif candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and isinstance(affinity_debug, dict):
                 candidate_endpoints = []
                 for cand_instance, cand_endpoint, _score in candidates:
-                    item = {"instance_id": cand_instance.id, "endpoint_id": cand_endpoint.id}
+                    item = {
+                        "instance_id": cand_instance.id,
+                        "endpoint_id": cand_endpoint.id,
+                    }
                     rec = affinity_debug.get((cand_instance.id, cand_endpoint.id))
                     if rec is not None:
                         item["matched_tokens"] = rec[0]
@@ -1734,7 +1845,8 @@ class AsyncSchedulerClient:
                 ]
 
         scheduler_type = self._scheduler_type_for_role(role)
-        if scheduler_type == "round_robin":
+        effective_scheduler_type = self._effective_scheduler_type_for_role(role)
+        if effective_scheduler_type == "round_robin":
             demand = Workload()
         elif scheduler_type == "dynamic_bucket":
             demand = make_dynamic_bucket_allocation_workload(req_info)
@@ -1744,7 +1856,11 @@ class AsyncSchedulerClient:
         isl = float(len(token_ids)) if isinstance(token_ids, list) and token_ids else 0.0
         candidate_pairs = [(int(item["instance_id"]), int(item["endpoint_id"])) for item in candidate_endpoints]
         affinity_triples = [
-            (int(item["instance_id"]), int(item["endpoint_id"]), float(item["prefill_cost"]))
+            (
+                int(item["instance_id"]),
+                int(item["endpoint_id"]),
+                float(item["prefill_cost"]),
+            )
             for item in candidate_endpoints
             if item.get("prefill_cost") is not None
         ]
@@ -1896,18 +2012,7 @@ class AsyncSchedulerClient:
                     prio_reason,
                     getattr(getattr(hint_info, "strict_priority", None), "level", None),
                 )
-                if self._session_affinity is not None and affinity_session_id:
-                    self._session_affinity.record(
-                        affinity_session_id,
-                        out_instance.id,
-                        getattr(role, "value", ""),
-                        epoch=affinity_epoch,
-                        endpoint_id=out_endpoint.id,
-                    )
-                    # Retention is recorded on the same request that establishes the
-                    # binding — after the pin exists, so the promise can be written
-                    # onto the shared slot (design §2.1; review 194528478).
-                    self._record_cache_declaration(hint_info, affinity_session_id, getattr(role, "value", ""))
+                self._record_allocation_state(role, req_info, out_instance, out_endpoint)
                 return (out_instance, out_endpoint, committed)
             if status == STATUS_CHANGED:
                 use_authoritative = True
@@ -1929,6 +2034,375 @@ class AsyncSchedulerClient:
             req_info.req_id,
         )
         return None
+
+    def _next_tars_attempt(self, request_id: str) -> int:
+        if self._tars_attempt_sequences is None:
+            raise RuntimeError("TARS is not enabled")
+        attempt_seq = self._tars_attempt_sequences.get(request_id, 0) + 1
+        self._tars_attempt_sequences[request_id] = attempt_seq
+        return attempt_seq
+
+    @staticmethod
+    def _tars_request_data(
+        req_info: RequestInfo,
+        *,
+        attempt_seq: int,
+        coordination_mode: str,
+        required_engine_type: str | None,
+    ) -> dict[str, Any]:
+        session_id = getattr(req_info.agent_hint_info, "session_id", None)
+        max_output_tokens = req_info.req_data.get(
+            "max_completion_tokens",
+            req_info.req_data.get("max_tokens", 0),
+        )
+        if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool) or max_output_tokens < 0:
+            max_output_tokens = 0
+        return {
+            "req_id": req_info.req_id,
+            "attempt_seq": attempt_seq,
+            "session_id": session_id,
+            "token_ids": req_info.token_ids,
+            "max_output_tokens": max_output_tokens,
+            # req_len is serialized request-body length, not a token count.
+            "decode_workload_tokens": max(1, max_output_tokens),
+            "coordination_mode": coordination_mode,
+            "required_engine_type": str(required_engine_type or "").strip().lower(),
+        }
+
+    async def _select_and_allocate_tars_single(
+        self,
+        role: PDRole,
+        req_info: RequestInfo,
+        *,
+        attempt_seq: int,
+        coordination_mode: str,
+        required_engine_type: str | None,
+    ) -> tuple[tuple[Instance, Endpoint, Workload] | None, bool]:
+        data = self._tars_request_data(
+            req_info,
+            attempt_seq=attempt_seq,
+            coordination_mode=coordination_mode,
+            required_engine_type=required_engine_type,
+        )
+        data["role"] = role.value
+        response = await self._send_tars_request(SchedulerRequestType.TARS_PREPARE_SINGLE, data)
+        payload = response.data if response and response.data else {}
+        if payload.get("fallback"):
+            return None, True
+        if response is None or response.response_type != SchedulerResponseType.SUCCESS:
+            if response is not None:
+                logger.error(
+                    "TARS single admission failed req_id=%s attempt=%s error=%s",
+                    req_info.req_id,
+                    attempt_seq,
+                    response.error,
+                )
+            return None, False
+        entry = self._persist_tars_delivery(payload)
+        try:
+            instance = _instance_from_dict(payload.get("instance") or {})
+            endpoint = _endpoint_from_dict(payload.get("endpoint") or {})
+            workload = Workload.model_validate(payload.get("workload") or {})
+            if instance is not None and endpoint is not None:
+                self._remember_tars_workload(entry, instance, endpoint)
+        except Exception as exc:
+            await self._revoke_tars_delivery(entry)
+            logger.error("Invalid TARS single allocation payload: %s", exc)
+            return None, False
+        if instance is None or endpoint is None:
+            await self._revoke_tars_delivery(entry)
+            return None, False
+        try:
+            confirmed = await self._confirm_tars_delivery(entry)
+        except BaseException:
+            await self._revoke_tars_delivery(entry)
+            raise
+        if not confirmed:
+            await self._revoke_tars_delivery(entry)
+            return None, False
+        self._record_allocation_state(role, req_info, instance, endpoint)
+        return (instance, endpoint, workload), False
+
+    async def tars_allocate_bootstrap_joint(
+        self,
+        req_info: RequestInfo,
+        *,
+        attempt_seq: int,
+        required_engine_type: str = "sglang",
+    ) -> tuple[tuple[Instance, Endpoint, Workload], tuple[Instance, Endpoint, Workload]] | None:
+        if not self._tars_enabled:
+            return None
+        data = self._tars_request_data(
+            req_info,
+            attempt_seq=attempt_seq,
+            coordination_mode="bootstrap",
+            required_engine_type=required_engine_type,
+        )
+        response = await self._send_tars_request(SchedulerRequestType.TARS_PREPARE_JOINT, data)
+        payload = response.data if response and response.data else {}
+        if payload.get("fallback"):
+            return None
+        if response is None or response.response_type != SchedulerResponseType.SUCCESS:
+            if response is not None:
+                logger.error(
+                    "TARS Bootstrap admission failed req_id=%s attempt=%s error=%s",
+                    req_info.req_id,
+                    attempt_seq,
+                    response.error,
+                )
+            raise RuntimeError(f"TARS Bootstrap admission failed req_id={req_info.req_id} attempt={attempt_seq}")
+        entry = self._persist_tars_delivery(payload)
+        try:
+            prefill = self._decode_tars_resource(payload["prefill"])
+            decode = self._decode_tars_resource(payload["decode"])
+            for instance, endpoint, _workload in (prefill, decode):
+                self._remember_tars_workload(entry, instance, endpoint)
+        except Exception as exc:
+            await self._revoke_tars_delivery(entry)
+            logger.error("Invalid TARS joint allocation payload: %s", exc)
+            raise RuntimeError("Invalid TARS Bootstrap allocation payload") from exc
+        try:
+            confirmed = await self._confirm_tars_delivery(entry)
+        except BaseException:
+            await self._revoke_tars_delivery(entry)
+            raise
+        if not confirmed:
+            await self._revoke_tars_delivery(entry)
+            raise RuntimeError("TARS Bootstrap allocation confirmation failed")
+        self._record_allocation_state(PDRole.ROLE_P, req_info, prefill[0], prefill[1])
+        self._record_allocation_state(PDRole.ROLE_D, req_info, decode[0], decode[1])
+        return prefill, decode
+
+    def _remember_tars_workload(self, entry: dict[str, Any], instance: Instance, endpoint: Endpoint) -> None:
+        if self._tars_workload_receipts is None:
+            raise RuntimeError("TARS workload received while TARS is disabled")
+        role = instance.role.value if hasattr(instance.role, "value") else str(instance.role)
+        key = (entry["req_id"], entry["attempt_seq"], role, instance.id, endpoint.id)
+        existing = self._tars_workload_receipts.get(key)
+        if existing is not None and existing["delivery"] != self._delivery_data(entry):
+            raise RuntimeError("TARS workload receipt identity conflict")
+        if existing is None:
+            self._tars_workload_receipts[key] = {
+                "delivery": self._delivery_data(entry),
+                "released": False,
+            }
+
+    def tars_forget_request(self, request_id: str) -> None:
+        """Drop acknowledged receipts only after all Router release tasks drained."""
+        receipts = self._tars_workload_receipts
+        if receipts is not None:
+            for key, receipt in tuple(receipts.items()):
+                if key[0] == request_id and receipt["released"]:
+                    del receipts[key]
+
+    async def _release_tars_workload(self, params: UpdateWorkloadParams, role: str) -> bool | None:
+        receipts = getattr(self, "_tars_workload_receipts", None)
+        if not receipts:
+            return None
+        if params.attempt_seq is not None:
+            key = (
+                params.req_id,
+                params.attempt_seq,
+                role,
+                params.instance_id,
+                params.endpoint_id,
+            )
+            matched = receipts.get(key)
+            matches = [matched] if matched is not None else []
+        else:
+            matches = [
+                receipt
+                for key, receipt in receipts.items()
+                if key[0] == params.req_id and key[2:] == (role, params.instance_id, params.endpoint_id)
+            ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            logger.error(
+                "Ambiguous TARS workload release req_id=%s; attempt_seq is required",
+                params.req_id,
+            )
+            return False
+        receipt = matches[0]
+        if receipt["released"]:
+            return True
+        data = dict(receipt["delivery"])
+        data.update(
+            {
+                "instance_id": params.instance_id,
+                "endpoint_id": params.endpoint_id,
+                "role": role,
+            }
+        )
+        response = await self._send_tars_request(SchedulerRequestType.TARS_RELEASE_WORKLOAD, data)
+        success = bool(
+            response
+            and response.response_type == SchedulerResponseType.SUCCESS
+            and response.data
+            and response.data.get("success") is True
+        )
+        if success:
+            receipt["released"] = True
+        return success
+
+    def tars_has_attempt(self, request_id: str, attempt_seq: int) -> bool:
+        """Return whether this Router still owns an active TARS delivery."""
+        return self._tars_entry(request_id, attempt_seq) is not None
+
+    async def tars_prefill_complete(
+        self,
+        request_id: str,
+        attempt_seq: int,
+        observed_ttft: float | None = None,
+    ) -> bool:
+        return await self._tars_lifecycle(request_id, attempt_seq, "prefill_complete", observed_ttft)
+
+    async def tars_request_complete(self, request_id: str, attempt_seq: int) -> bool:
+        return await self._tars_lifecycle(request_id, attempt_seq, "request_complete")
+
+    async def tars_abort(self, request_id: str, attempt_seq: int) -> bool:
+        return await self._tars_lifecycle(request_id, attempt_seq, "abort")
+
+    async def tars_commit_decode(
+        self,
+        request_id: str,
+        attempt_seq: int,
+        instance_id: int,
+        dp_rank: int,
+    ) -> bool:
+        entry = self._tars_entry(request_id, attempt_seq)
+        if entry is None or entry.get("kind") != "single":
+            return not self._tars_enabled
+        data = self._delivery_data(entry)
+        data.update({"instance_id": instance_id, "dp_rank": dp_rank})
+        response = await self._send_tars_request(SchedulerRequestType.TARS_COMMIT_DECODE, data)
+        return bool(response and response.response_type == SchedulerResponseType.SUCCESS)
+
+    async def _tars_lifecycle(
+        self,
+        request_id: str,
+        attempt_seq: int,
+        event: str,
+        observed_ttft: float | None = None,
+    ) -> bool:
+        entry = self._tars_entry(request_id, attempt_seq)
+        if entry is None:
+            return not self._tars_enabled
+        data = self._delivery_data(entry)
+        data["event"] = event
+        if observed_ttft is not None:
+            data["observed_ttft"] = observed_ttft
+        response = await self._send_tars_request(SchedulerRequestType.TARS_LIFECYCLE, data)
+        success = bool(response and response.response_type == SchedulerResponseType.SUCCESS)
+        if event in ("request_complete", "abort") and success and self._tars_ledger is not None:
+            self._tars_ledger.pop((request_id, attempt_seq), None)
+        return success
+
+    async def _send_tars_request(
+        self,
+        request_type: SchedulerRequestType,
+        data: dict[str, Any],
+    ) -> SchedulerResponse | None:
+        request = SchedulerRequest(
+            request_type=request_type,
+            request_id=self._next_request_id(),
+            data=data,
+        )
+        return await self._transport.send_request(request)
+
+    def _persist_tars_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._tars_ledger is None:
+            raise RuntimeError("TARS delivery received while TARS is disabled")
+        identity = payload.get("identity") or {}
+        entry = {
+            "kind": payload.get("kind"),
+            "req_id": identity.get("request_id"),
+            "attempt_seq": identity.get("attempt_seq"),
+            "scheduler_epoch": identity.get("scheduler_epoch"),
+            "delivery_token": payload.get("delivery_token"),
+            "confirmed": False,
+        }
+        if entry["kind"] not in ("single", "joint"):
+            raise ValueError("TARS delivery kind must be single or joint")
+        if not isinstance(entry["req_id"], str) or not entry["req_id"]:
+            raise ValueError("TARS delivery request_id must be non-empty")
+        if not isinstance(entry["attempt_seq"], int) or isinstance(entry["attempt_seq"], bool):
+            raise ValueError("TARS delivery attempt_seq must be an integer")
+        if entry["attempt_seq"] <= 0:
+            raise ValueError("TARS delivery attempt_seq must be positive")
+        if not isinstance(entry["scheduler_epoch"], int) or isinstance(entry["scheduler_epoch"], bool):
+            raise ValueError("TARS delivery scheduler_epoch must be an integer")
+        if entry["scheduler_epoch"] < 0:
+            raise ValueError("TARS delivery scheduler_epoch must be non-negative")
+        if not isinstance(entry["delivery_token"], str) or not entry["delivery_token"]:
+            raise ValueError("TARS delivery token must be non-empty")
+        key = (entry["req_id"], entry["attempt_seq"])
+        existing = self._tars_ledger.get(key)
+        if existing is not None and existing != entry:
+            raise RuntimeError("TARS Router ledger identity conflict")
+        self._tars_ledger[key] = entry
+        return entry
+
+    async def _confirm_tars_delivery(self, entry: dict[str, Any]) -> bool:
+        response = await self._send_tars_request(SchedulerRequestType.TARS_CONFIRM, self._delivery_data(entry))
+        if response and response.response_type == SchedulerResponseType.SUCCESS:
+            entry["confirmed"] = True
+            return True
+        status = await self._tars_delivery_status(entry)
+        if status is not None and status.get("confirmed") is True:
+            entry["confirmed"] = True
+            return True
+        return False
+
+    async def _revoke_tars_delivery(self, entry: dict[str, Any]) -> bool:
+        response = await self._send_tars_request(SchedulerRequestType.TARS_REVOKE, self._delivery_data(entry))
+        success = bool(response and response.response_type == SchedulerResponseType.SUCCESS)
+        if not success:
+            status = await self._tars_delivery_status(entry)
+            success = bool(status and status.get("state") in {"allocation_revoked", "joint_allocation_revoked"})
+        if success and self._tars_ledger is not None:
+            self._tars_ledger.pop((entry["req_id"], entry["attempt_seq"]), None)
+            receipts = self._tars_workload_receipts
+            if receipts is not None:
+                delivery = self._delivery_data(entry)
+                for key, receipt in tuple(receipts.items()):
+                    if receipt["delivery"] == delivery:
+                        del receipts[key]
+        return success
+
+    async def _tars_delivery_status(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        response = await self._send_tars_request(
+            SchedulerRequestType.TARS_STATUS,
+            self._delivery_data(entry),
+        )
+        if response is None or response.response_type != SchedulerResponseType.SUCCESS:
+            return None
+        return response.data or {}
+
+    def _tars_entry(self, request_id: str, attempt_seq: int) -> dict[str, Any] | None:
+        if self._tars_ledger is None:
+            return None
+        return self._tars_ledger.get((request_id, attempt_seq))
+
+    @staticmethod
+    def _delivery_data(entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "kind": entry["kind"],
+            "req_id": entry["req_id"],
+            "attempt_seq": entry["attempt_seq"],
+            "scheduler_epoch": entry["scheduler_epoch"],
+            "delivery_token": entry["delivery_token"],
+        }
+
+    @staticmethod
+    def _decode_tars_resource(
+        data: dict[str, Any],
+    ) -> tuple[Instance, Endpoint, Workload]:
+        instance = _instance_from_dict(data.get("instance") or {})
+        endpoint = _endpoint_from_dict(data.get("endpoint") or {})
+        if instance is None or endpoint is None:
+            raise ValueError("TARS resource is missing instance or endpoint")
+        return instance, endpoint, Workload.model_validate(data.get("workload") or {})
 
     async def claim_sample(
         self,
@@ -1954,7 +2428,11 @@ class AsyncSchedulerClient:
         if response and response.response_type == SchedulerResponseType.SUCCESS:
             return bool((response.data or {}).get("confirmed", False))
         if response:
-            logger.warning("claim_sample failed d_instance_id=%s error=%s", d_instance_id, response.error)
+            logger.warning(
+                "claim_sample failed d_instance_id=%s error=%s",
+                d_instance_id,
+                response.error,
+            )
         else:
             logger.warning("claim_sample: no response (timeout) d_instance_id=%s", d_instance_id)
         return False
@@ -2082,22 +2560,25 @@ class AsyncSchedulerClient:
         return False
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
-        """Release path: CAS-sub floor 0 on schema-4 SHM (no UPDATE_WORKLOAD ZMQ)."""
-        from motor.coordinator.scheduler.runtime.workload_shm.native import STATUS_OK
-
-        role_str = params.role.value if hasattr(params.role, "value") else str(params.role)
-        if self._workload_reader is None or self._workload_reader.native is None:
+        """Release through the allocation owner: TARS RPC or worker SHM CAS."""
+        if params.workload_action != WorkloadAction.RELEASE_TOKENS:
             logger.error(
-                "update_workload refused: native workload shm not attached instance_id=%s endpoint_id=%s req_id=%s",
+                "update_workload refused: action=%s is not RELEASE_TOKENS instance_id=%s endpoint_id=%s req_id=%s",
+                getattr(params.workload_action, "value", params.workload_action),
                 params.instance_id,
                 params.endpoint_id,
                 params.req_id,
             )
             return False
-        if params.workload_action != WorkloadAction.RELEASE_TOKENS:
+        role_str = params.role.value if hasattr(params.role, "value") else str(params.role)
+        tars_result = await self._release_tars_workload(params, role_str)
+        if tars_result is not None:
+            return tars_result
+        from motor.coordinator.scheduler.runtime.workload_shm.native import STATUS_OK
+
+        if self._workload_reader is None or self._workload_reader.native is None:
             logger.error(
-                "update_workload refused: action=%s is not RELEASE_TOKENS instance_id=%s endpoint_id=%s req_id=%s",
-                getattr(params.workload_action, "value", params.workload_action),
+                "update_workload refused: native workload shm not attached instance_id=%s endpoint_id=%s req_id=%s",
                 params.instance_id,
                 params.endpoint_id,
                 params.req_id,
@@ -2439,7 +2920,10 @@ class AsyncSchedulerClient:
                 listener(session_id, state, epoch=epoch)
             except Exception as e:
                 logger.warning(
-                    "agent status state listener failed: session_id=%s state=%s err=%s", session_id, state, e
+                    "agent status state listener failed: session_id=%s state=%s err=%s",
+                    session_id,
+                    state,
+                    e,
                 )
         if state != "finalize":
             logger.debug(
@@ -2668,7 +3152,12 @@ class AsyncSchedulerClient:
                     block_end=block_end,
                 )
             except ValueError as e:
-                logger.warning("kvc %s skipped: invalid request: session_id=%s error=%s", edit_type, session_id, e)
+                logger.warning(
+                    "kvc %s skipped: invalid request: session_id=%s error=%s",
+                    edit_type,
+                    session_id,
+                    e,
+                )
                 # Keep the results already collected (and try the remaining pins);
                 # an invalid body for one instance must not discard partial success.
                 continue
@@ -2744,8 +3233,8 @@ class AsyncSchedulerClient:
         top_k: int = 1,
     ) -> tuple[list[tuple[Instance, Endpoint, float]], str]:
         if not instances:
-            return [], self._scheduler_type_for_role(role)
-        st = self._scheduler_type_for_role(role)
+            return [], self._effective_scheduler_type_for_role(role)
+        st = self._effective_scheduler_type_for_role(role)
         if st == "load_balance":
             candidates = self._select_endpoint_candidates_by_load_balance(
                 instances, role, top_k, req_id=req_info.req_id
@@ -2835,7 +3324,7 @@ class AsyncSchedulerClient:
         all_endpoints = instance.get_all_endpoints()
         if not all_endpoints:
             return None
-        st = self._scheduler_type_for_role(role)
+        st = self._effective_scheduler_type_for_role(role)
         if st in ("load_balance", "kv_cache_affinity", "dynamic_bucket"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
@@ -2845,6 +3334,12 @@ class AsyncSchedulerClient:
             instance, self._endpoint_rr_counters, is_blocked=self.is_instance_blocked
         )
         return (instance, ep) if ep else None
+
+    def _effective_scheduler_type_for_role(self, role: PDRole | None = None) -> str:
+        scheduler_type = self._scheduler_type_for_role(role)
+        if scheduler_type == "tars":
+            return self._tars_fallback_policy
+        return scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN
 
     def _get_dynamic_bucket_candidates(
         self,

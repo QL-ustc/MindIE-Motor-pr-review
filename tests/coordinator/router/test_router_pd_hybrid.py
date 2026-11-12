@@ -24,6 +24,7 @@ import motor.common.utils.error as cancel_error
 
 from motor.config.coordinator import (
     CoordinatorConfig,
+    SchedulerConfig,
     SchedulerType,
     ExceptionConfig,
     TracerConfig,
@@ -161,7 +162,8 @@ async def test_decode_colocation_is_last_hybrid_candidate_and_keeps_request_bare
 
 
 @pytest.mark.asyncio
-async def test_decode_colocation_filters_allocation_without_pinning_first_candidate():
+@pytest.mark.parametrize("attempt_seq", [None, 3])
+async def test_decode_colocation_filters_allocation_without_pinning_first_candidate(attempt_seq):
     """A mixed Decode pool must keep scheduling among all eligible instances."""
     eligible = Instance(
         job_name="vllm-decode",
@@ -201,7 +203,11 @@ async def test_decode_colocation_filters_allocation_without_pinning_first_candid
     hybrid = PDHybridRouter(req_info, config, scheduler=scheduler, request_manager=RequestManager(config))
 
     with pytest.raises(HTTPException) as exc_info:
-        await hybrid.prepare_resource(PDRole.ROLE_D)
+        await hybrid.prepare_resource(
+            PDRole.ROLE_D,
+            attempt_seq=attempt_seq,
+            coordination_mode="unified" if attempt_seq is not None else None,
+        )
 
     assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert scheduler.selection == (
@@ -210,7 +216,30 @@ async def test_decode_colocation_filters_allocation_without_pinning_first_candid
             "target_instance_id": None,
             "required_engine_type": "vllm",
             "required_dispatch_capability": DispatchPlan.DECODE_COLOCATION.value,
+            **({"attempt_seq": attempt_seq, "coordination_mode": "unified"} if attempt_seq is not None else {}),
         },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [PDRole.ROLE_U, PDRole.ROLE_P])
+async def test_hybrid_forwards_attempt_identity_for_union_and_prefill(role):
+    config = CoordinatorConfig()
+    config.exception_config.max_retry = 1
+    req_info = RequestInfo(req_id="hybrid-attempt", req_data={}, req_len=1, api="/test")
+    scheduler = MagicMock()
+    scheduler.select_and_allocate = AsyncMock(return_value=None)
+    hybrid = PDHybridRouter(req_info, config, scheduler=scheduler, request_manager=RequestManager(config))
+
+    with pytest.raises(HTTPException):
+        await hybrid.prepare_resource(role, attempt_seq=3, coordination_mode="unified")
+
+    scheduler.select_and_allocate.assert_awaited_once_with(
+        role,
+        req_info,
+        target_instance_id=None,
+        attempt_seq=3,
+        coordination_mode="unified",
     )
 
 
@@ -340,7 +369,7 @@ class TestRouterPDHybrid:
         monkeypatch.setattr(Scheduler, "select_and_allocate", mock_select_and_allocate, raising=False)
         monkeypatch.setattr(Scheduler, "update_workload", mock_update_workload, raising=False)
 
-        mock_scheduler_config = MagicMock()
+        mock_scheduler_config = SchedulerConfig()
         mock_scheduler_config.prefill_scheduler_type = SchedulerType.LOAD_BALANCE
         mock_scheduler_config.decode_scheduler_type = SchedulerType.LOAD_BALANCE
         mock_exception_config = ExceptionConfig(max_retry=5, retry_delay=0.0001)
@@ -827,7 +856,7 @@ class TestRouterPDHybrid:
 
 
 def _make_tracer_coordinator_config(monkeypatch: MonkeyPatch) -> MagicMock:
-    mock_scheduler_config = MagicMock()
+    mock_scheduler_config = SchedulerConfig()
     mock_scheduler_config.prefill_scheduler_type = SchedulerType.LOAD_BALANCE
     mock_scheduler_config.decode_scheduler_type = SchedulerType.LOAD_BALANCE
     mock_exception_config = ExceptionConfig(max_retry=5, retry_delay=0.0001, transport_max_retry=1)
@@ -1117,7 +1146,7 @@ def _make_cancel_test_config(
     transport_max_retry: int = 2,
     reschedule_enabled: bool = True,
 ) -> MagicMock:
-    mock_scheduler_config = MagicMock()
+    mock_scheduler_config = SchedulerConfig()
     mock_scheduler_config.prefill_scheduler_type = SchedulerType.LOAD_BALANCE
     mock_scheduler_config.decode_scheduler_type = SchedulerType.LOAD_BALANCE
     mock_exception_config = ExceptionConfig(

@@ -23,6 +23,7 @@ from motor.coordinator.scheduler.policy.dynamic_bucket import DynamicBucketPolic
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.tars.policy import TarsPolicy
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
@@ -38,6 +39,11 @@ class TestPolicyFactory(unittest.TestCase):
         """create returns a LoadBalancePolicy for LOAD_BALANCE type."""
         policy = create(SchedulerType.LOAD_BALANCE, MockInstanceProvider())
         self.assertIsInstance(policy, LoadBalancePolicy)
+
+    def test_create_tars(self):
+        """TARS is registered only after all dormant protocol layers exist."""
+        policy = create(SchedulerType.TARS, MockInstanceProvider())
+        self.assertIsInstance(policy, TarsPolicy)
 
     def test_create_dynamic_bucket_does_not_read_global_config(self):
         """Dynamic bucket policy construction does not reload process-global config."""

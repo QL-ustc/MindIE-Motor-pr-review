@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Any, AsyncGenerator
 
 import httpx
+from anyio import CancelScope
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
@@ -761,12 +762,35 @@ class UnifiedPDRouter(BaseRouter):
 
     async def _create_attempt(self, session: PDDispatchSession) -> AttemptContext:
         attempt_seq = session._attempt_seq + 1
-        if await self._pd_cluster_uses_trigger():
+        uses_trigger = await self._pd_cluster_uses_trigger()
+        bootstrap_fallback = False
+        if self._tars_enabled and not uses_trigger and await self._pd_cluster_uses_bootstrap():
+            allocate_joint = getattr(self._scheduler, "tars_allocate_bootstrap_joint", None)
+            if allocate_joint is None:
+                raise HTTPException(status_code=503, detail="TARS Bootstrap transport is unavailable")
+            joint = await allocate_joint(
+                self.req_info,
+                attempt_seq=attempt_seq,
+                required_engine_type="sglang",
+            )
+            if joint is not None:
+                return await self._record_tars_joint_attempt(session, attempt_seq, joint)
+            bootstrap_fallback = True
+
+        if uses_trigger:
             self._ensure_trigger_metaserver()
-            d_resource = await self._prepare_attempt_resource(PDRole.ROLE_D, attempt_seq)
+            d_resource = await self._prepare_attempt_resource(
+                PDRole.ROLE_D,
+                attempt_seq,
+                coordination_mode="fallback" if self._tars_enabled else None,
+            )
             return session.new_attempt(None, d_resource, self.config)
 
-        p_resource = await self._prepare_attempt_resource(PDRole.ROLE_P, attempt_seq)
+        p_resource = await self._prepare_attempt_resource(
+            PDRole.ROLE_P,
+            attempt_seq,
+            coordination_mode=("fallback" if bootstrap_fallback else ("handoff" if self._tars_enabled else None)),
+        )
 
         # Handoff connectors (CPCD-style) do not need a concrete decode endpoint while prefill runs.
         # Allocate D after prefill completes so long prompts do not reserve stale decode workload for
@@ -799,6 +823,60 @@ class UnifiedPDRouter(BaseRouter):
             raise
         return session.new_attempt(p_resource, d_resource, self.config)
 
+    async def _record_tars_joint_attempt(
+        self,
+        session: PDDispatchSession,
+        attempt_seq: int,
+        joint,
+    ) -> AttemptContext:
+        (p_instance, p_endpoint, p_workload), (d_instance, d_endpoint, d_workload) = joint
+        added_p = False
+        try:
+            added_p = await self._request_manager.add_req_attempt_workload(
+                self.req_info.req_id,
+                attempt_seq,
+                PDRole.ROLE_P,
+                p_workload,
+                instance_id=p_instance.id,
+                endpoint_id=p_endpoint.id,
+            )
+            added_d = False
+            if added_p:
+                added_d = await self._request_manager.add_req_attempt_workload(
+                    self.req_info.req_id,
+                    attempt_seq,
+                    PDRole.ROLE_D,
+                    d_workload,
+                    instance_id=d_instance.id,
+                    endpoint_id=d_endpoint.id,
+                )
+            if not (added_p and added_d):
+                raise RuntimeError(f"Request {self.req_info.req_id} could not persist atomic Bootstrap workloads")
+        except BaseException:
+            with CancelScope(shield=True):
+                await self._scheduler.tars_abort(self.req_info.req_id, attempt_seq)
+                for instance, endpoint, workload in (joint[1], joint[0]):
+                    released = await self._rollback_allocated_workload(
+                        instance,
+                        endpoint,
+                        PDRole(instance.role),
+                        workload,
+                        attempt_seq=attempt_seq,
+                    )
+                    if released:
+                        await self._request_manager.del_req_attempt_workload(
+                            self.req_info.req_id,
+                            attempt_seq,
+                            PDRole(instance.role),
+                        )
+            raise
+        self.req_info.update_state(ReqState.D_ALLOCATED)
+        return session.new_attempt(
+            ScheduledResource(instance=p_instance, endpoint=p_endpoint),
+            ScheduledResource(instance=d_instance, endpoint=d_endpoint),
+            self.config,
+        )
+
     @staticmethod
     def _should_defer_decode_allocation(
         prefill_resource: ScheduledResource | None,
@@ -816,6 +894,31 @@ class UnifiedPDRouter(BaseRouter):
             return self._pd_uses_trigger
         self._pd_uses_trigger = await self._detect_vllm_trigger_cluster()
         return self._pd_uses_trigger
+
+    @property
+    def _tars_enabled(self) -> bool:
+        return self.config.scheduler_config.uses_tars()
+
+    async def _pd_cluster_uses_bootstrap(self) -> bool:
+        get_instances = getattr(self._scheduler, "get_local_instances", None)
+        if get_instances is None:
+            get_instances = getattr(self._scheduler, "get_available_instances", None)
+        if get_instances is None:
+            return False
+        instances = await get_instances(PDRole.ROLE_P)
+        get_unblocked = getattr(self._scheduler, "get_unblocked_instances", None)
+        unblocked = set(await get_unblocked(PDRole.ROLE_P)) if get_unblocked is not None else None
+        engines = {
+            str(instance.engine_type or "").strip().lower()
+            for instance in instances.values()
+            if unblocked is None or instance.id in unblocked
+        }
+        if "sglang" in engines and len(engines) > 1:
+            raise HTTPException(
+                status_code=503,
+                detail="Mixed Bootstrap and non-Bootstrap Prefill engines are not supported with TARS",
+            )
+        return engines == {"sglang"}
 
     async def _detect_vllm_trigger_cluster(self) -> bool:
         p_plans = await self._vllm_dispatch_plans(PDRole.ROLE_P)
@@ -1695,6 +1798,7 @@ class UnifiedPDRouter(BaseRouter):
                                 PDRole.ROLE_P,
                                 attempt.attempt_seq,
                                 required_engine_type=str(attempt.decode_resource.instance.engine_type),
+                                coordination_mode="trigger" if self._tars_enabled else None,
                             )
                 if self.req_info.is_cancelled or attempt.state in (
                     AttemptState.STOPPING,
@@ -1925,7 +2029,7 @@ class UnifiedPDRouter(BaseRouter):
             response, error, used_token_only, generate_body = await d_task
             if error:
                 await attempt.cancel(repr(error))
-                await self._release_attempt(attempt, wait=False)
+                await self._release_attempt(attempt, wait=False, terminal_event="abort")
                 await self._drain_release_tasks()
                 raise error
             if prefill_task is not None:
@@ -1960,7 +2064,7 @@ class UnifiedPDRouter(BaseRouter):
                 e,
             )
             await attempt.cancel(repr(e))
-            await self._release_attempt(attempt, wait=False)
+            await self._release_attempt(attempt, wait=False, terminal_event="abort")
             await self._drain_release_tasks()
             raise
 
@@ -2399,6 +2503,7 @@ class UnifiedPDRouter(BaseRouter):
             PDRole.ROLE_D,
             attempt.attempt_seq,
             required_engine_type=adapter.engine_type,
+            coordination_mode="fallback" if self._tars_enabled else None,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
         self.logger.info(
@@ -2414,6 +2519,13 @@ class UnifiedPDRouter(BaseRouter):
             decode_engine_type = getattr(attempt.decode_resource.instance, "engine_type", None)
             if not isinstance(decode_engine_type, str) or decode_engine_type.strip().lower() != adapter.engine_type:
                 raise RuntimeError(f"{adapter.engine_type} handoff requires a matching decode instance")
+            if self._tars_enabled and not await self._scheduler.tars_commit_decode(
+                self.req_info.req_id,
+                attempt.attempt_seq,
+                d_resource.instance.id,
+                d_resource.endpoint.id,
+            ):
+                raise RuntimeError("TARS rejected deferred Decode target")
         except Exception:
             await self._release_attempt_resource(
                 d_resource,
@@ -2731,6 +2843,7 @@ class UnifiedPDRouter(BaseRouter):
         attempt_seq: int,
         *,
         required_engine_type: str | None = None,
+        coordination_mode: str | None = None,
     ) -> ScheduledResource:
         self.req_info.update_state(ReqState.P_SCHEDULING if role == PDRole.ROLE_P else ReqState.D_SCHEDULING)
         target_instance_id = None
@@ -2740,6 +2853,10 @@ class UnifiedPDRouter(BaseRouter):
         scheduler_kwargs = {"target_instance_id": target_instance_id}
         if required_engine_type is not None:
             scheduler_kwargs["required_engine_type"] = required_engine_type
+        if coordination_mode is not None:
+            scheduler_kwargs["coordination_mode"] = coordination_mode
+        if self._tars_enabled:
+            scheduler_kwargs["attempt_seq"] = attempt_seq
         result = await self._scheduler.select_and_allocate(role, self.req_info, **scheduler_kwargs)
         if result is None:
             error_message = f"No instance available for role {role}"
@@ -2770,17 +2887,39 @@ class UnifiedPDRouter(BaseRouter):
                 endpoint.id,
                 e,
             )
-            await self._rollback_allocated_workload(ins, endpoint, role, workload)
+            await self._rollback_allocated_workload(ins, endpoint, role, workload, attempt_seq=attempt_seq)
             raise
         if not recorded:
-            await self._rollback_allocated_workload(ins, endpoint, role, workload)
+            await self._rollback_allocated_workload(ins, endpoint, role, workload, attempt_seq=attempt_seq)
             raise RuntimeError(
                 f"Request {self.req_info.req_id} already allocated for attempt {attempt_seq} role {role}"
             )
         self.req_info.update_state(ReqState.P_ALLOCATED if role == PDRole.ROLE_P else ReqState.D_ALLOCATED)
         return ScheduledResource(instance=ins, endpoint=endpoint)
 
-    async def _release_attempt(self, attempt: AttemptContext, *, wait: bool = True) -> None:
+    async def _release_attempt(
+        self,
+        attempt: AttemptContext,
+        *,
+        wait: bool = True,
+        terminal_event: str = "request_complete",
+    ) -> None:
+        if self._tars_enabled and self._scheduler.tars_has_attempt(
+            self.req_info.req_id,
+            attempt.attempt_seq,
+        ):
+            if terminal_event != "abort" and not await self._settle_tars_prefill(attempt):
+                terminal_event = "abort"
+            lifecycle = (
+                self._scheduler.tars_abort if terminal_event == "abort" else self._scheduler.tars_request_complete
+            )
+            if not await lifecycle(self.req_info.req_id, attempt.attempt_seq):
+                self.logger.warning(
+                    "TARS terminal lifecycle failed req_id=%s attempt=%s event=%s",
+                    self.req_info.req_id,
+                    attempt.attempt_seq,
+                    terminal_event,
+                )
         if attempt.prefill_resource:
             await self._release_attempt_resource(
                 attempt.prefill_resource,
@@ -2801,6 +2940,42 @@ class UnifiedPDRouter(BaseRouter):
     async def _drain_pending_releases(self) -> None:
         """Unified PD runs releases as background tasks; settle them before residual reclaim."""
         await self._drain_release_tasks()
+
+    async def _settle_tars_prefill(self, attempt: AttemptContext) -> bool:
+        """Settle Prefill and bind deferred Decode before a TARS terminal event."""
+        if not self._scheduler.tars_has_attempt(self.req_info.req_id, attempt.attempt_seq):
+            return True
+        if attempt.prefill_resource is None:
+            return True
+        if not await self._scheduler.tars_prefill_complete(
+            self.req_info.req_id,
+            attempt.attempt_seq,
+        ):
+            self.logger.warning(
+                "TARS Prefill settlement failed req_id=%s attempt_seq=%s",
+                self.req_info.req_id,
+                attempt.attempt_seq,
+            )
+            return False
+        if attempt.decode_resource is None:
+            return True
+        coordination_mode = self._select_coordination_mode(attempt)
+        if coordination_mode is CoordinationMode.BOOTSTRAP:
+            return True
+        decode = attempt.decode_resource
+        if await self._scheduler.tars_commit_decode(
+            self.req_info.req_id,
+            attempt.attempt_seq,
+            decode.instance.id,
+            decode.endpoint.id,
+        ):
+            return True
+        self.logger.warning(
+            "TARS Decode binding failed req_id=%s attempt_seq=%s",
+            self.req_info.req_id,
+            attempt.attempt_seq,
+        )
+        return False
 
     def _submit_prefill_release_background(self, attempt: AttemptContext, action: WorkloadAction) -> None:
         if attempt.prefill_resource is None:
@@ -2892,6 +3067,23 @@ class UnifiedPDRouter(BaseRouter):
         task_context: ReleaseTaskContext | None = None,
     ) -> bool:
         try:
+            role = PDRole(resource.instance.role)
+            if (
+                self._tars_enabled
+                and role is PDRole.ROLE_P
+                and action is WorkloadAction.RELEASE_TOKENS
+                and self._scheduler.tars_has_attempt(self.req_info.req_id, attempt_seq)
+            ):
+                settled = (
+                    await self._settle_tars_prefill(attempt)
+                    if attempt is not None
+                    else await self._scheduler.tars_prefill_complete(
+                        self.req_info.req_id,
+                        attempt_seq,
+                    )
+                )
+                if not settled:
+                    await self._scheduler.tars_abort(self.req_info.req_id, attempt_seq)
             if attempt is not None and self._release_already_marked(attempt, PDRole(resource.instance.role), action):
                 self.logger.debug(
                     "Release workload task skipped already_released stage=%s req_id=%s attempt_seq=%s action=%s",
@@ -2962,6 +3154,7 @@ class UnifiedPDRouter(BaseRouter):
             req_id=self.req_info.req_id,
             workload_action=action,
             workload_change=workload_change,
+            attempt_seq=attempt_seq,
             # Deterministic id for log/trace correlation across retries only -- the CAS release
             # path does not dedup on it (see _mark_released in _release_attempt_resource_task).
             operation_id=(
@@ -3202,7 +3395,7 @@ class UnifiedPDRouter(BaseRouter):
             attempt.stop()
             await self._abort_native_attempt(attempt)
             await attempt.cancel(reason.value)
-            await self._release_attempt(attempt, wait=False)
+            await self._release_attempt(attempt, wait=False, terminal_event="abort")
             try:
                 await self._drain_release_tasks()
             except asyncio.CancelledError:

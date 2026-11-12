@@ -58,6 +58,11 @@ class SchedulerConnectionManager:
         """
         scheduler_config = DEFAULT_SCHEDULER_PROCESS_CONFIG
         inference_workers_config = coordinator_config.inference_workers_config
+        request_timeout = (
+            coordinator_config.scheduler_config.tars.client_timeout_s
+            if coordinator_config.scheduler_config.uses_tars()
+            else scheduler_config.timeout
+        )
 
         if coordinator_config.worker_index is not None:
             client_index = coordinator_config.worker_index
@@ -69,7 +74,7 @@ class SchedulerConnectionManager:
         client_config = SchedulerClientConfig(
             scheduler_address=scheduler_config.frontend_address,
             instance_pub_address=scheduler_config.instance_pub_address,
-            timeout=scheduler_config.timeout,
+            timeout=request_timeout,
             reconnect_interval=scheduler_config.reconnect_interval,
             prefill_scheduler_type=coordinator_config.scheduler_config.prefill_scheduler_type.value,
             decode_scheduler_type=coordinator_config.scheduler_config.decode_scheduler_type.value,
@@ -84,6 +89,7 @@ class SchedulerConnectionManager:
             dynamic_bucket_short_bucket_count=coordinator_config.scheduler_config.dynamic_bucket_short_bucket_count,
             dynamic_bucket_long_bucket_count=coordinator_config.scheduler_config.dynamic_bucket_long_bucket_count,
             kv_affinity=coordinator_config.scheduler_config.kv_affinity,
+            tars=coordinator_config.scheduler_config.tars,
             dp_stats_window=coordinator_config.scheduler_config.dp_stats_window,
             priority_load_threshold=coordinator_config.scheduler_config.priority_load_threshold,
             priority_admission_level=coordinator_config.scheduler_config.priority_admission_level,

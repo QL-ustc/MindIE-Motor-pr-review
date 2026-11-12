@@ -14,7 +14,7 @@ import math
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -200,6 +200,7 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
+    TARS = "tars"
     DYNAMIC_BUCKET = "dynamic_bucket"
 
     @classmethod
@@ -210,6 +211,18 @@ class SchedulerType(Enum):
         except (KeyError, AttributeError):
             logger.warning("Invalid scheduler type: %s", value)
             return None
+
+
+def is_tars_enabled(
+    prefill_scheduler_type: SchedulerType | str,
+    decode_scheduler_type: SchedulerType | str,
+) -> bool:
+    """Require both roles to participate in the stateful TARS protocol."""
+    prefill_tars = getattr(prefill_scheduler_type, "value", prefill_scheduler_type) == SchedulerType.TARS.value
+    decode_tars = getattr(decode_scheduler_type, "value", decode_scheduler_type) == SchedulerType.TARS.value
+    if prefill_tars != decode_tars:
+        raise ValueError("TARS requires prefill_scheduler_type and decode_scheduler_type to both be 'tars'")
+    return prefill_tars
 
 
 # Sub-strategy selected by SchedulerConfig.kv_affinity.mode when a role uses kv_cache_affinity.
@@ -396,6 +409,39 @@ class KvAffinityConfig:
     hit_rate_threshold: float = 0.0
 
 
+TARS_FALLBACK_POLICIES = ("load_balance", "round_robin")
+
+
+@dataclass
+class TarsConfig:
+    """Public TARS algorithm, capacity, and reliability configuration.
+
+    Capacity and timeout fields are stateful Scheduler-process settings. They
+    are intentionally restart-required rather than hot-reloaded.
+    """
+
+    fallback_policy: str = "load_balance"
+    enable_decision_log: bool = False
+    balance_type: str = "tars"
+    prefill_tpot: float = 0.000127
+    tpct: float | None = None
+    tprt: float = 0.0
+    ttft_slo: float = 5.0
+    dh_first_balance_ttft_threshold: float | None = None
+    pending_token_capacity: int = 1_000_000
+    running_block_capacity: int = 65_536
+    decode_token_capacity: int = 1_000_000
+    queue_wait_s: float = 1.0
+    final_query_s: float = 1.0
+    exact_commit_s: float = 1.0
+    settlement_margin_s: float = 1.0
+    server_timeout_s: float = 5.0
+    client_timeout_s: float = 6.0
+    delivery_lease_s: float = 10.0
+    drain_timeout_s: float = 30.0
+    recovery_cooldown_s: float = 30.0
+
+
 @dataclass
 class SchedulerConfig:
     prefill_scheduler_type: SchedulerType = field(default=SchedulerType.LOAD_BALANCE)
@@ -433,6 +479,8 @@ class SchedulerConfig:
     affinity_load_gate_ratio: float = 0.0
     # kv_cache_affinity tunables (affinity + load + per-medium weights).
     kv_affinity: KvAffinityConfig = field(default_factory=KvAffinityConfig)
+    # TARS is a joint P/D protocol and must be enabled for both roles.
+    tars: TarsConfig = field(default_factory=TarsConfig)
     # KV event registration config for kv-conductor.
     kv_conductor_config: KvConductorConfig = field(default_factory=KvConductorConfig)
 
@@ -454,6 +502,10 @@ class SchedulerConfig:
     def uses_dynamic_bucket(self) -> bool:
         """Dynamic bucket scheduling is supported only for decode."""
         return self.decode_scheduler_type == SchedulerType.DYNAMIC_BUCKET
+
+    def uses_tars(self) -> bool:
+        """Validate the role pair and report whether the joint TARS protocol is enabled."""
+        return is_tars_enabled(self.prefill_scheduler_type, self.decode_scheduler_type)
 
     @property
     def scheduler_type(self) -> SchedulerType:
@@ -1008,9 +1060,22 @@ class CoordinatorConfig:
                     if enum_value is not None:
                         setattr(obj, key, enum_value)
 
+            def set_tars_config(obj, key, value):
+                """Load the explicit TARS schema and reject retired experiment knobs."""
+                if not isinstance(value, dict):
+                    raise ValueError("scheduler_config.tars must be a JSON object")
+                target = getattr(obj, key)
+                allowed = {item.name for item in fields(target)}
+                unknown = sorted(set(value) - allowed)
+                if unknown:
+                    raise ValueError(f"Unknown scheduler_config.tars field(s): {', '.join(unknown)}")
+                update_config_from_dict(target, value)
+
             scheduler_handlers = {
+                'scheduler_type': lambda obj, key, value: set_enum_field(obj, key, value, SchedulerType),
                 "prefill_scheduler_type": lambda obj, key, value: set_enum_field(obj, key, value, SchedulerType),
                 "decode_scheduler_type": lambda obj, key, value: set_enum_field(obj, key, value, SchedulerType),
+                'tars': set_tars_config,
             }
 
             exception_config_data = cfg.get("exception_config", {})
@@ -1379,6 +1444,7 @@ class CoordinatorConfig:
         )
         if affinity.mode not in KV_AFFINITY_MODES:
             self._errors.append(f"kv_affinity.mode must be one of {KV_AFFINITY_MODES}, got {affinity.mode!r}")
+        self._validate_tars_config()
         if self.context_budget_mode not in CONTEXT_BUDGET_MODES:
             self._errors.append(
                 f"context_budget_mode must be one of {CONTEXT_BUDGET_MODES}, got {self.context_budget_mode!r}"
@@ -1679,6 +1745,63 @@ class CoordinatorConfig:
             f"    └─ Config Path: {self.config_path or 'Not set'}\n"
             f"{separator}"
         )
+
+    def _validate_tars_config(self) -> None:
+        """Validate TARS without changing non-TARS startup behavior."""
+        try:
+            self.scheduler_config.uses_tars()
+        except ValueError as error:
+            self._errors.append(str(error))
+        tars = self.scheduler_config.tars
+        if tars.fallback_policy not in TARS_FALLBACK_POLICIES:
+            self._errors.append(
+                f"tars.fallback_policy must be one of {TARS_FALLBACK_POLICIES}, got {tars.fallback_policy!r}"
+            )
+        if not isinstance(tars.enable_decision_log, bool):
+            self._errors.append("tars.enable_decision_log must be a bool")
+        if tars.balance_type != "tars":
+            self._errors.append("tars.balance_type must be 'tars'")
+        for name in ("prefill_tpot", "ttft_slo"):
+            self._validate_positive_number(getattr(tars, name), f"tars.{name}")
+        if tars.tpct is not None:
+            self._validate_positive_number(tars.tpct, "tars.tpct")
+        self._validate_positive_number(tars.tprt, "tars.tprt", allow_zero=True)
+        if tars.dh_first_balance_ttft_threshold is not None:
+            self._validate_positive_number(
+                tars.dh_first_balance_ttft_threshold,
+                "tars.dh_first_balance_ttft_threshold",
+                allow_zero=True,
+            )
+        for name in (
+            "pending_token_capacity",
+            "running_block_capacity",
+            "decode_token_capacity",
+        ):
+            value = getattr(tars, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                self._errors.append(f"tars.{name} must be a positive integer")
+        timeout_names = (
+            "queue_wait_s",
+            "final_query_s",
+            "exact_commit_s",
+            "settlement_margin_s",
+            "server_timeout_s",
+            "client_timeout_s",
+            "delivery_lease_s",
+            "drain_timeout_s",
+            "recovery_cooldown_s",
+        )
+        for name in timeout_names:
+            self._validate_positive_number(getattr(tars, name), f"tars.{name}")
+        stage_total = tars.queue_wait_s + tars.final_query_s + tars.exact_commit_s + tars.settlement_margin_s
+        if tars.server_timeout_s <= stage_total:
+            self._errors.append("tars.server_timeout_s must exceed the stage budget plus settlement margin")
+        if tars.client_timeout_s <= tars.server_timeout_s:
+            self._errors.append("tars.client_timeout_s must exceed tars.server_timeout_s")
+        if tars.delivery_lease_s <= tars.client_timeout_s:
+            self._errors.append("tars.delivery_lease_s must exceed tars.client_timeout_s")
+        if tars.drain_timeout_s <= tars.delivery_lease_s:
+            self._errors.append("tars.drain_timeout_s must exceed tars.delivery_lease_s")
 
     def _validate_dynamic_bucket_config(self) -> None:
         """Reject invalid bucket tunables before scheduler workers are created."""

@@ -69,7 +69,6 @@ exclusive ``flock`` on the backing file, so ops are serialized machine-wide
 (microsecond-scale critical sections).
 """
 
-import fcntl
 import hashlib
 import os
 import struct
@@ -78,6 +77,12 @@ from collections.abc import Iterable, Mapping
 from typing import NamedTuple
 
 from motor.common.logger import get_logger
+
+try:
+    import fcntl
+except ModuleNotFoundError:
+    # Pure session selection is also used when the optional POSIX backend is disabled.
+    fcntl = None
 
 logger = get_logger(__name__)
 
@@ -193,6 +198,8 @@ class SharedSessionAffinityTable:
     """
 
     def __init__(self, max_entries: int = _DEFAULT_MAX_ENTRIES, shm_key: str = "default") -> None:
+        if fcntl is None:
+            raise ImportError("Shared session affinity requires POSIX fcntl")
         self._max_entries = max(1, int(max_entries))
         self._slot_count = self._max_entries
         self._path = os.path.join(_SHM_DIR, _SHM_NAME_PREFIX + shm_key + ".bin")

@@ -251,15 +251,18 @@ class BaseRouter(ABC):
             yield
         finally:
             with CancelScope(shield=True):
-                await self._reclaim_residual_workloads()
+                releases_drained = await self._reclaim_residual_workloads()
                 await self._request_manager.del_req_info(self.req_info.req_id)
+                forget_tars = getattr(type(self._scheduler), "tars_forget_request", None)
+                if releases_drained and forget_tars is not None:
+                    forget_tars(self._scheduler, self.req_info.req_id)
             self._log_request_details()
 
     async def _drain_pending_releases(self) -> None:
         """Hook: routers that run background release tasks drain them before residual reclaim."""
         return
 
-    async def _reclaim_residual_workloads(self) -> None:
+    async def _reclaim_residual_workloads(self) -> bool:
         """Release scheduler-ledger entries whose local records survived the whole request.
 
         Must run after all in-flight releases settle (see _drain_pending_releases), because a
@@ -275,7 +278,7 @@ class BaseRouter(ABC):
                 self.req_info.req_id,
                 e,
             )
-            return
+            return False
         residuals = await self._request_manager.pop_residual_workloads(self.req_info.req_id)
         for key, workload, owner in residuals:
             if owner is None:
@@ -303,6 +306,7 @@ class BaseRouter(ABC):
                 req_id=self.req_info.req_id,
                 workload_action=WorkloadAction.RELEASE_TOKENS,
                 workload_change=Workload(active_tokens=-workload.active_tokens),
+                attempt_seq=key[1] if len(key) == 3 else None,
             )
             try:
                 ok = await self._scheduler.update_workload(params)
@@ -322,6 +326,7 @@ class BaseRouter(ABC):
                     instance_id,
                     endpoint_id,
                 )
+        return True
 
     @contextlib.asynccontextmanager
     async def _manage_client_context(self, resource: ScheduledResource):
@@ -349,12 +354,23 @@ class BaseRouter(ABC):
             self._forward_resource = previous
 
     @contextlib.asynccontextmanager
-    async def _manage_resource_context(self, role: PDRole, release_func):
+    async def _manage_resource_context(
+        self,
+        role: PDRole,
+        release_func,
+        *,
+        attempt_seq: int | None = None,
+        coordination_mode: str | None = None,
+    ):
         resource: ScheduledResource | None = None
         trace_obj = self.req_info.trace_obj
         try:
             trace_obj.add_trace_event("Begin Scheduled Resource", is_meta=self.is_meta)
-            resource = await self.prepare_resource(role)
+            resource = await self.prepare_resource(
+                role,
+                attempt_seq=attempt_seq,
+                coordination_mode=coordination_mode,
+            )
             attributes = {
                 "instance": f"{resource.instance.id}-{resource.instance.role}",
                 "endpoint": f"{resource.endpoint.id}-{resource.endpoint.ip}:{resource.endpoint.business_port}",
@@ -384,6 +400,8 @@ class BaseRouter(ABC):
         target_instance_id: int | None = None,
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
+        attempt_seq: int | None = None,
+        coordination_mode: str | None = None,
     ) -> ScheduledResource:
         """Select instance + allocate workload (one RPC), record in RequestManager, retry on failure."""
         self.req_info.update_state(_scheduling_state_for_role(role))
@@ -402,6 +420,10 @@ class BaseRouter(ABC):
                     scheduler_kwargs["required_engine_type"] = required_engine_type
                 if required_dispatch_capability is not None:
                     scheduler_kwargs["required_dispatch_capability"] = required_dispatch_capability
+                if attempt_seq is not None:
+                    scheduler_kwargs["attempt_seq"] = attempt_seq
+                if coordination_mode is not None:
+                    scheduler_kwargs["coordination_mode"] = coordination_mode
                 result = await self._scheduler.select_and_allocate(role, self.req_info, **scheduler_kwargs)
                 elapsed_select_ms = (time.perf_counter() - t0_select) * 1000
                 if _should_log_scheduling_sample(self.req_info.req_id):
@@ -443,10 +465,14 @@ class BaseRouter(ABC):
                         endpoint.id,
                         e,
                     )
-                    await self._rollback_allocated_workload(ins, endpoint, role, allocate_workload)
+                    await self._rollback_allocated_workload(
+                        ins, endpoint, role, allocate_workload, attempt_seq=attempt_seq
+                    )
                     raise
                 if not recorded:
-                    await self._rollback_allocated_workload(ins, endpoint, role, allocate_workload)
+                    await self._rollback_allocated_workload(
+                        ins, endpoint, role, allocate_workload, attempt_seq=attempt_seq
+                    )
                     msg = f"Request {self.req_info.req_id} already allocated for role {role}"
                     raise RuntimeError(msg)
 
@@ -472,7 +498,7 @@ class BaseRouter(ABC):
                     endpoint.status,
                     ins.model_name,
                 )
-                return ScheduledResource(instance=ins, endpoint=endpoint)
+                return ScheduledResource(instance=ins, endpoint=endpoint, attempt_seq=attempt_seq)
 
             except Exception as e:
                 last_exception = e
@@ -505,6 +531,8 @@ class BaseRouter(ABC):
         endpoint: Endpoint,
         role: PDRole,
         allocate_workload: Workload,
+        *,
+        attempt_seq: int | None = None,
     ) -> bool:
         """Undo a scheduler allocation if local request workload bookkeeping fails."""
         rollback_workload = Workload(
@@ -517,6 +545,7 @@ class BaseRouter(ABC):
             req_id=self.req_info.req_id,
             workload_action=WorkloadAction.RELEASE_TOKENS,
             workload_change=rollback_workload,
+            attempt_seq=attempt_seq,
         )
         with CancelScope(shield=True):
             success = await self._scheduler.update_workload(params)
@@ -885,6 +914,7 @@ class BaseRouter(ABC):
             req_id=self.req_info.req_id,
             workload_action=action,
             workload_change=workload_change,
+            attempt_seq=resource.attempt_seq,
         )
         # Shield covers finalize_release too: it is the only gate against re-sending this release,
         # so it must not be interrupted by the same cancellation that shields update_workload.

@@ -37,6 +37,14 @@ class SchedulerRequestType(str, Enum):
     FINISH_PRECISION_ACTION = "finish_precision_action"  # clear probing after probe/alarm
     DISMISS_PRECISION_ALARM_STATE = "dismiss_precision_alarm_state"  # external recovery cleared alarm
     CIRCUIT_BREAKER_REPORT = "circuit_breaker_report"  # worker reports instance failure/success
+    TARS_PREPARE_SINGLE = "tars_prepare_single"
+    TARS_PREPARE_JOINT = "tars_prepare_joint"
+    TARS_CONFIRM = "tars_confirm"
+    TARS_REVOKE = "tars_revoke"
+    TARS_STATUS = "tars_status"
+    TARS_LIFECYCLE = "tars_lifecycle"
+    TARS_COMMIT_DECODE = "tars_commit_decode"
+    TARS_RELEASE_WORKLOAD = "tars_release_workload"
     AGENT_STATUS_NOTIFY = (
         "agent_status_notify"  # worker relays out-of-band agent_status to PUB (finalize releases pins)
     )

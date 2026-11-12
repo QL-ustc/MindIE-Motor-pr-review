@@ -227,11 +227,34 @@ class PDHybridRouter(BaseRouter):
             raise HTTPException(status_code=503, detail=error_message)
 
         role = candidate_roles[0]
-        async with self._manage_resource_context(role, self.release_all) as resource:
-            self._scheduled_resource = resource
-            if resource.instance and resource.endpoint:
-                self._cb_iid = resource.instance.id
-            yield resource
+        attempt_seq = attempt + 1
+        completed = False
+        async with self._manage_resource_context(
+            role,
+            self.release_all,
+            attempt_seq=attempt_seq,
+            coordination_mode="unified",
+        ) as resource:
+            try:
+                self._scheduled_resource = resource
+                if resource.instance and resource.endpoint:
+                    self._cb_iid = resource.instance.id
+                yield resource
+                completed = True
+            finally:
+                if self._tars_enabled:
+                    lifecycle = self._scheduler.tars_request_complete if completed else self._scheduler.tars_abort
+                    if not await lifecycle(self.req_info.req_id, attempt_seq):
+                        self.logger.warning(
+                            "TARS PDHybrid lifecycle failed req_id=%s attempt=%s completed=%s",
+                            self.req_info.req_id,
+                            attempt_seq,
+                            completed,
+                        )
+
+    @property
+    def _tars_enabled(self) -> bool:
+        return self.config.scheduler_config.uses_tars()
 
     async def prepare_resource(
         self,
@@ -240,6 +263,8 @@ class PDHybridRouter(BaseRouter):
         target_instance_id: int | None = None,
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
+        attempt_seq: int | None = None,
+        coordination_mode: str | None = None,
     ) -> ScheduledResource:
         """Pin Decode co-location to an instance that passed the capability gate."""
         if role != PDRole.ROLE_D:
@@ -248,6 +273,8 @@ class PDHybridRouter(BaseRouter):
                 target_instance_id=target_instance_id,
                 required_engine_type=required_engine_type,
                 required_dispatch_capability=required_dispatch_capability,
+                attempt_seq=attempt_seq,
+                coordination_mode=coordination_mode,
             )
 
         candidate_ids = await get_decode_colocation_candidate_ids(self._scheduler)
@@ -264,6 +291,8 @@ class PDHybridRouter(BaseRouter):
             target_instance_id=selected_target,
             required_engine_type="vllm",
             required_dispatch_capability=DispatchPlan.DECODE_COLOCATION.value,
+            attempt_seq=attempt_seq,
+            coordination_mode=coordination_mode,
         )
 
     async def _report_cb(self, event: str) -> None:

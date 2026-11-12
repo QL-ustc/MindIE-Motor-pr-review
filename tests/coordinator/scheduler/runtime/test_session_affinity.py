@@ -11,11 +11,13 @@
 
 import pytest
 
+from motor.coordinator.scheduler.runtime import session_affinity_shared
 from motor.coordinator.scheduler.runtime.session_affinity import (
     AFFINITY_ENV_FLAG,
     AFFINITY_MAX_ENV,
     AFFINITY_PLACEMENT_ENV,
     AFFINITY_ROUTE_ENV,
+    AFFINITY_SHARED_ENV_FLAG,
     NEW_PIN_OUTCOMES,
     PLACEMENT_BALANCED,
     PLACEMENT_POLICY,
@@ -283,6 +285,35 @@ def test_create_from_env_invalid_max_falls_back_to_default(monkeypatch):
     assert isinstance(table, SessionAffinityTable)
     table.record("s-1", 1, ROLE_U)
     assert table.get("s-1", ROLE_U) is not None
+
+
+def test_shared_table_without_fcntl_fails_before_allocating_resources(monkeypatch):
+    monkeypatch.setattr(session_affinity_shared, "fcntl", None)
+
+    def unexpected_open(*_args, **_kwargs):
+        pytest.fail("A platform without fcntl must not create shared table resources")
+
+    monkeypatch.setattr(session_affinity_shared.os, "open", unexpected_open)
+    with pytest.raises(ImportError, match="POSIX fcntl"):
+        session_affinity_shared.SharedSessionAffinityTable()
+
+
+@pytest.mark.parametrize("shared", ["0", "1"])
+def test_missing_fcntl_keeps_local_affinity_policy_usable(monkeypatch, shared):
+    monkeypatch.setattr(session_affinity_shared, "fcntl", None)
+    monkeypatch.setenv(AFFINITY_ENV_FLAG, "1")
+    monkeypatch.setenv(AFFINITY_SHARED_ENV_FLAG, shared)
+    monkeypatch.setenv(AFFINITY_MAX_ENV, "2")
+    table = create_session_affinity_from_env()
+
+    assert isinstance(table, SessionAffinityTable)
+    table.record("s-1", 7, ROLE_U, epoch=0)
+    decision = resolve_session_pin(table, "s-1", None, 0, ROLE_U, {7, 8})
+    assert (decision.instance_id, decision.outcome) == (7, "hit")
+    table.record("s-2", 8, ROLE_U)
+    table.record("s-3", 8, ROLE_U)
+    assert len(table) == 2
+    assert table.get("s-1", ROLE_U) is None
 
 
 def test_drop_all_roles_releases_every_role_pin():
